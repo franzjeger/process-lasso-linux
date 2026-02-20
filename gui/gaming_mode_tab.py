@@ -350,6 +350,8 @@ class GamingModeTab(QWidget):
         self._append_log("[Gaming Mode] Disabled — all CPUs online.")
         self.gaming_mode_changed.emit(False, False)
         self.log_message.emit("[Gaming Mode] disabled")
+        # Refresh topology + checkbox grid now that all CPUs are back online
+        self._detect_topology()
 
     def _reset_all(self):
         ans = QMessageBox.question(
@@ -363,15 +365,20 @@ class GamingModeTab(QWidget):
         if ans != QMessageBox.StandardButton.Yes:
             return
 
-        # Unpark CPUs first
-        if cpu_park.get_offline_cpus():
-            self._append_log("[Reset] Unparking CPUs…")
-            cpu_park.unpark_all(log_cb=self._append_log)
+        # Notify MonitorThread to restore nice values before anything else
+        if self._parked:
+            self.gaming_mode_changed.emit(False, False)
             self._parked = False
             self._park_btn.setText("▶  Enable Gaming Mode (Park non-preferred CPUs)")
             self._park_btn.setStyleSheet("")
+
+        # Unpark CPUs
+        if cpu_park.get_offline_cpus():
+            self._append_log("[Reset] Unparking CPUs…")
+            cpu_park.unpark_all(log_cb=self._append_log)
             self._update_cpu_status()
-            self.gaming_mode_changed.emit(False, False)
+            # Refresh topology grid now that all CPUs are back online
+            self._detect_topology()
 
         # Restore per-process affinities via monitor
         self.reset_requested.emit()

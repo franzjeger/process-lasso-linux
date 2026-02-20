@@ -160,6 +160,12 @@ class MainWindow(QMainWindow):
         self._monitor.log_message.connect(self._append_log)
         self._monitor.start()
 
+        # Sync Gaming Mode: if the app started with CPUs already parked the
+        # gaming_mode_changed signal fired during GamingModeTab.__init__ before
+        # the monitor existed — notify it now.
+        if self._gaming_tab._parked:
+            self._monitor.set_gaming_mode(True, self._gaming_tab._nice_cb.isChecked())
+
     @pyqtSlot(list)
     def _on_snapshot(self, snapshot: list):
         throttled = self._probalance.get_throttled_pids()

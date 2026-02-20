@@ -529,10 +529,18 @@ class RuleEditDialog(QDialog):
                     self._affinity_edit.setText(dlg.get_selected_affinity())
 
     def _validate_and_accept(self):
+        import re
         from PyQt6.QtWidgets import QMessageBox
-        if not self._pattern_edit.text().strip():
+        pattern = self._pattern_edit.text().strip()
+        if not pattern:
             QMessageBox.warning(self, "Validation", "Pattern cannot be empty.")
             return
+        if self._match_combo.currentText() == "regex":
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                QMessageBox.warning(self, "Validation", f"Invalid regular expression:\n{exc}")
+                return
         affinity = self._affinity_edit.text().strip()
         if affinity and not utils.validate_cpulist(affinity):
             QMessageBox.warning(self, "Validation", f"Invalid CPU affinity format: '{affinity}'")

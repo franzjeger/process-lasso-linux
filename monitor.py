@@ -246,6 +246,7 @@ class MonitorThread(QThread):
         snapshot: list[dict] = []
 
         while not self._stop:
+          try:
             now = time.monotonic()
 
             # Collect current snapshot
@@ -316,3 +317,6 @@ class MonitorThread(QThread):
                 last_snapshot = now
 
             time.sleep(tick_interval)
+          except Exception as exc:
+            log.exception("MonitorThread: unexpected error in main loop: %s", exc)
+            time.sleep(1.0)  # brief back-off to avoid busy-spinning on persistent errors
