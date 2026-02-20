@@ -18,35 +18,114 @@ import utils
 
 
 class AffinityDialog(QDialog):
-    """CPU affinity picker: checkbox grid of all CPUs."""
+    """CPU affinity picker: topology-aware checkbox grid."""
 
     def __init__(self, current_affinity: str = "", parent=None, title_suffix: str = ""):
         super().__init__(parent)
         self.setWindowTitle(f"Set CPU Affinity{' — ' + title_suffix if title_suffix else ''}")
+        # Always use total CPU count (present), not just online count
         self._cpu_count = utils.get_cpu_count()
         self._checkboxes: list[QCheckBox] = []
         self._build_ui(current_affinity)
+        self.setMinimumWidth(520)
+        self.adjustSize()
 
     def _build_ui(self, current_affinity: str):
         layout = QVBoxLayout(self)
-
-        # Parse existing selection
         selected = self._parse_cpulist(current_affinity)
+
+        # Gather topology info for CCD-aware display
+        try:
+            import cpu_park as _cp
+            offline = _cp.get_offline_cpus()
+            topo = _cp.detect_topology()
+            smt_siblings = _cp.get_smt_siblings_of(set(range(self._cpu_count)))
+        except Exception:
+            offline = set()
+            topo = None
+            smt_siblings = set()
+
+        preferred   = set(topo.preferred)     if (topo and topo.has_asymmetry) else set()
+        non_pref    = set(topo.non_preferred)  if (topo and topo.has_asymmetry) else set()
+
+        # cb_map[cpu] = QCheckBox for that CPU
+        cb_map: dict[int, QCheckBox] = {}
 
         group = QGroupBox("Select CPUs")
         grid = QGridLayout(group)
-        cols = 8
-        for i in range(self._cpu_count):
-            cb = QCheckBox(str(i))
-            cb.setChecked(i in selected)
-            row, col = divmod(i, cols)
-            grid.addWidget(cb, row, col)
-            self._checkboxes.append(cb)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.setContentsMargins(8, 8, 8, 8)
+
+        if preferred and non_pref:
+            # ── Topology-aware: group by CCD + physical/HT ──────────────
+            pref_phys  = sorted(c for c in preferred if c not in smt_siblings)
+            pref_ht    = sorted(c for c in preferred if c in smt_siblings)
+            npref_phys = sorted(c for c in non_pref  if c not in smt_siblings)
+            npref_ht   = sorted(c for c in non_pref  if c in smt_siblings)
+
+            from cpu_park import TopologyKind
+            if topo and topo.kind == TopologyKind.AMD_X3D:
+                ccd0_name, ccd1_name = "CCD0 (V-Cache — preferred)", "CCD1 (parked in Gaming Mode)"
+            else:
+                ccd0_name, ccd1_name = "Preferred CCD", "Non-preferred CCD (parked in Gaming Mode)"
+
+            row = [0]
+
+            def add_section(title: str, cpus: list[int]):
+                hdr = QLabel(title)
+                hdr.setStyleSheet(
+                    "font-size: 11px; font-weight: 600; "
+                    "color: rgba(167,139,250,0.9); padding-top: 6px;"
+                )
+                grid.addWidget(hdr, row[0], 0, 1, 8)
+                row[0] += 1
+                for col, cpu in enumerate(cpus):
+                    cb = QCheckBox(str(cpu))
+                    cb.setChecked(cpu in selected)
+                    if cpu in offline:
+                        cb.setEnabled(False)
+                        cb.setToolTip(f"CPU {cpu} is parked — disable Gaming Mode to use it")
+                    grid.addWidget(cb, row[0], col)
+                    cb_map[cpu] = cb
+                row[0] += 1
+
+            if pref_phys:
+                add_section(f"  {ccd0_name} — physical cores", pref_phys)
+            if pref_ht:
+                add_section(f"  {ccd0_name} — HT siblings", pref_ht)
+            if npref_phys:
+                add_section(f"  {ccd1_name} — physical cores", npref_phys)
+            if npref_ht:
+                add_section(f"  {ccd1_name} — HT siblings", npref_ht)
+
+        else:
+            # ── Flat grid fallback for uniform / unknown topology ────────
+            cols = 8
+            for i in range(self._cpu_count):
+                cb = QCheckBox(str(i))
+                cb.setChecked(i in selected)
+                if i in offline:
+                    cb.setEnabled(False)
+                    cb.setToolTip(f"CPU {i} is currently parked")
+                r, c = divmod(i, cols)
+                grid.addWidget(cb, r, c)
+                cb_map[i] = cb
+
+        # Build ordered list: self._checkboxes[i] = checkbox for CPU i
+        self._checkboxes = [cb_map.get(i, QCheckBox(str(i))) for i in range(self._cpu_count)]
+
+        if offline:
+            offline_str = utils._cpuset_to_cpulist(offline)
+            note = QLabel(f"⚠  CPUs {offline_str} are parked (Gaming Mode active) — unpark to select them.")
+            note.setStyleSheet("color: rgba(249,226,175,0.85); font-size: 11px;")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
         layout.addWidget(group)
 
-        # Select all / none buttons
         btn_row = QHBoxLayout()
-        all_btn = QPushButton("All")
+        all_btn  = QPushButton("All")
         none_btn = QPushButton("None")
         all_btn.clicked.connect(self._select_all)
         none_btn.clicked.connect(self._select_none)
@@ -84,11 +163,13 @@ class AffinityDialog(QDialog):
 
     def _select_all(self):
         for cb in self._checkboxes:
-            cb.setChecked(True)
+            if cb.isEnabled():
+                cb.setChecked(True)
 
     def _select_none(self):
         for cb in self._checkboxes:
-            cb.setChecked(False)
+            if cb.isEnabled():
+                cb.setChecked(False)
 
     def _validate_and_accept(self):
         selected = [i for i, cb in enumerate(self._checkboxes) if cb.isChecked()]

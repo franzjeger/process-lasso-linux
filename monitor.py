@@ -110,6 +110,11 @@ class MonitorThread(QThread):
         self._gaming_mode_elevate_nice: bool = False
         self._gaming_niced: dict[int, int] = {}  # pid → original nice
 
+        # Manual affinity overrides: pid → expiry monotonic time.
+        # While an entry is active, the enforcement loop skips rule re-application
+        # for that PID so the user's manual change isn't immediately reverted.
+        self._manual_overrides: dict[int, float] = {}
+
         # Wire log callbacks
         rule_engine.set_log_callback(self._emit_log)
         probalance.set_log_callback(self._emit_log)
@@ -165,6 +170,12 @@ class MonitorThread(QThread):
                 pass
         self._gaming_niced.clear()
         self._emit_log(f"[Gaming Mode] Restored nice for {count} processes.")
+
+    def set_manual_affinity_override(self, pid: int, duration_s: float = 30.0):
+        """Suppress rule enforcement for pid for duration_s seconds.
+        Called when the user manually changes a process's affinity via the GUI
+        so that the enforcement loop doesn't immediately revert the change."""
+        self._manual_overrides[pid] = time.monotonic() + duration_s
 
     def stop(self):
         self._stop = True
@@ -266,8 +277,15 @@ class MonitorThread(QThread):
 
             # Rule enforcement every 0.5s (rules only — not default, too expensive)
             if elapsed_enforce >= enforce_interval:
+                # Expire stale manual overrides
+                self._manual_overrides = {
+                    pid: exp for pid, exp in self._manual_overrides.items() if exp > now
+                }
                 for info in snapshot:
-                    self._rule_engine.apply_to_process(info["pid"], info["name"])
+                    pid = info["pid"]
+                    if pid in self._manual_overrides:
+                        continue  # user manually set affinity — don't override for now
+                    self._rule_engine.apply_to_process(pid, info["name"])
                 last_enforce = now
 
             # ProBalance every 1.0s
@@ -281,8 +299,18 @@ class MonitorThread(QThread):
             if elapsed_snap >= snapshot_interval:
                 self.process_snapshot_ready.emit(list(snapshot))
                 try:
-                    cpu_percents = psutil.cpu_percent(percpu=True)
-                    self.cpu_snapshot_ready.emit(list(cpu_percents))
+                    raw = psutil.cpu_percent(percpu=True)
+                    # psutil returns only ONLINE CPUs in cpu-number order.
+                    # When Gaming Mode parks a CCD the list is shorter and
+                    # the indices no longer match CPU numbers.
+                    # Build a full-length list indexed by actual CPU number.
+                    online = sorted(utils.get_online_cpus())
+                    total  = utils.get_cpu_count()
+                    full   = [0.0] * total
+                    for idx, cpu_num in enumerate(online):
+                        if idx < len(raw) and cpu_num < total:
+                            full[cpu_num] = raw[idx]
+                    self.cpu_snapshot_ready.emit(full)
                 except Exception:
                     pass
                 last_snapshot = now

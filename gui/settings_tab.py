@@ -91,6 +91,20 @@ class SettingsTab(QWidget):
         mon_form.addRow("", apply_mon_btn)
 
         layout.addWidget(mon_group)
+
+        # ── Appearance ──────────────────────────────────────────────────────
+        appear_group = QGroupBox("Appearance")
+        appear_layout = QVBoxLayout(appear_group)
+
+        self._system_theme_cb = QCheckBox("Use system theme (disables custom dark purple theme)")
+        self._system_theme_cb.setToolTip(
+            "When checked, Process Lasso uses your OS/desktop dark/light theme\n"
+            "instead of its built-in glassmorphism dark purple stylesheet.\n"
+            "Click 'Apply Monitor Settings' to apply immediately."
+        )
+        appear_layout.addWidget(self._system_theme_cb)
+
+        layout.addWidget(appear_group)
         layout.addStretch()
 
         self._load_config()
@@ -105,6 +119,10 @@ class SettingsTab(QWidget):
         mon = self._config.get("monitor", {})
         self._rule_interval.setValue(mon.get("rule_enforce_interval_ms", 500))
         self._display_interval.setValue(mon.get("display_refresh_interval_ms", 2000))
+
+        self._system_theme_cb.setChecked(
+            self._config.get("ui", {}).get("use_system_theme", False)
+        )
 
     def _pick_affinity(self):
         current = self._default_affinity_edit.text().strip()
@@ -137,8 +155,9 @@ class SettingsTab(QWidget):
     def _apply_monitor(self):
         self._config.setdefault("monitor", {})["rule_enforce_interval_ms"] = self._rule_interval.value()
         self._config.setdefault("monitor", {})["display_refresh_interval_ms"] = self._display_interval.value()
+        self._config.setdefault("ui", {})["use_system_theme"] = self._system_theme_cb.isChecked()
         self.settings_changed.emit(self._config)
-        QMessageBox.information(self, "Monitor Settings", "Monitor intervals updated.")
+        QMessageBox.information(self, "Monitor Settings", "Settings applied.")
 
     def update_config(self, config: dict):
         self._config = config

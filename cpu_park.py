@@ -27,6 +27,11 @@ from enum import Enum, auto
 
 log = logging.getLogger(__name__)
 
+# Module-level topology cache: preserved across detect_topology() calls within
+# a session.  Once we have a good asymmetric result, we keep it even if a later
+# call occurs after Gaming Mode has parked one CCD (making sysfs unreadable).
+_topo_cache: "CPUTopology | None" = None
+
 HELPER      = "/usr/local/bin/process-lasso-sysfs"
 SUDOERS_FILE = "/etc/sudoers.d/process-lasso"
 
@@ -85,18 +90,55 @@ class CPUTopology:
         return bool(self.non_preferred)
 
 
+# ── SMT sibling detection ───────────────────────────────────────────────────
+
+def get_smt_siblings_of(cpus: set[int]) -> set[int]:
+    """Return the SMT sibling threads within a set of CPUs.
+
+    Reads /sys/.../topology/core_id to group logical CPUs by physical core.
+    For each physical core that has 2+ logical CPUs in the set, all but the
+    lowest-numbered are considered SMT siblings.
+    Returns an empty set when SMT is disabled or there are no siblings.
+    """
+    core_to_logical: dict[int, list[int]] = {}
+    for cpu in sorted(cpus):
+        path = f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
+        try:
+            core_id = int(open(path).read().strip())
+            core_to_logical.setdefault(core_id, []).append(cpu)
+        except (OSError, ValueError):
+            pass
+    siblings: set[int] = set()
+    for logical_cpus in core_to_logical.values():
+        if len(logical_cpus) >= 2:
+            primary = min(logical_cpus)
+            siblings.update(c for c in logical_cpus if c != primary)
+    return siblings
+
+
 # ── Detection ───────────────────────────────────────────────────────────────
 
 def detect_topology() -> CPUTopology:
-    """Auto-detect CPU topology.  Tries AMD X3D first, then Intel hybrid."""
+    """Auto-detect CPU topology.  Tries AMD X3D first, then Intel hybrid.
+
+    Caches the last asymmetric result so topology is preserved even when Gaming
+    Mode has parked one CCD, making sysfs L3/freq files unreadable for those CPUs.
+    """
+    global _topo_cache
     topo = _detect_amd_x3d()
     if topo.has_asymmetry:
+        _topo_cache = topo
         return topo
     topo = _detect_intel_hybrid()
     if topo.has_asymmetry:
+        _topo_cache = topo
         return topo
-    # Uniform: all CPUs equally capable
-    all_cpus = set(range(os.cpu_count() or 1))
+    # If live detection returned UNIFORM but we have a cached asymmetric result
+    # from earlier in this session (before Gaming Mode parked cores), return it.
+    if _topo_cache is not None and _topo_cache.has_asymmetry:
+        return _topo_cache
+    # True uniform: all CPUs equally capable
+    all_cpus = _parse_cpulist_file("/sys/devices/system/cpu/present") or set(range(os.cpu_count() or 1))
     return CPUTopology(
         kind=TopologyKind.UNIFORM,
         preferred=all_cpus,
@@ -106,9 +148,17 @@ def detect_topology() -> CPUTopology:
 
 def _detect_amd_x3d() -> CPUTopology:
     """Detect AMD X3D: preferred CCD has larger L3 (3D V-Cache).
-    e.g. Ryzen 9 7950X3D: CCD0=96MB (preferred), CCD1=32MB."""
+    e.g. Ryzen 9 7950X3D: CCD0=96MB (preferred), CCD1=32MB.
+
+    When Gaming Mode is already active (CPUs parked), the offline CPUs' sysfs
+    L3 entries are unreadable.  In that case all readable CPUs show the same L3
+    (the online CCD).  We detect this by checking whether there are offline CPUs
+    — if so, the offline set IS the non-preferred CCD and we return accordingly.
+    """
+    present = _parse_cpulist_file("/sys/devices/system/cpu/present") or set(range(os.cpu_count() or 1))
+    offline = _parse_cpulist_file("/sys/devices/system/cpu/offline")
     l3: dict[int, int] = {}
-    for cpu in range(os.cpu_count() or 1):
+    for cpu in sorted(present):
         path = f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/size"
         try:
             raw = open(path).read().strip()
@@ -119,18 +169,34 @@ def _detect_amd_x3d() -> CPUTopology:
             else:
                 l3[cpu] = int(raw)
         except (OSError, ValueError):
-            pass
+            pass  # offline CPU — sysfs entry gone
 
     if not l3:
         return CPUTopology()
 
     sizes = set(l3.values())
     if len(sizes) <= 1:
-        return CPUTopology()   # uniform L3 — not X3D
+        # All readable (online) CPUs have the same L3.
+        # If there are offline CPUs, the other CCD is parked by Gaming Mode —
+        # infer: online CPUs = preferred, offline CPUs = non-preferred.
+        if offline and l3:
+            online_kb = next(iter(sizes))
+            online_set = set(l3.keys())
+            return CPUTopology(
+                kind=TopologyKind.AMD_X3D,
+                preferred=online_set,
+                non_preferred=offline,
+                description=(
+                    f"AMD X3D detected (other CCD currently parked). "
+                    f"Preferred (V-Cache, {online_kb//1024}MB L3): CPUs {_fmt(online_set)}. "
+                    f"Non-preferred (parked): CPUs {_fmt(offline)}."
+                ),
+            )
+        return CPUTopology()   # genuine uniform L3 — not X3D
 
     max_kb = max(sizes)
     min_kb = min(sizes)
-    preferred    = {cpu for cpu, s in l3.items() if s == max_kb}
+    preferred     = {cpu for cpu, s in l3.items() if s == max_kb}
     non_preferred = {cpu for cpu, s in l3.items() if s == min_kb}
 
     return CPUTopology(
@@ -148,8 +214,9 @@ def _detect_amd_x3d() -> CPUTopology:
 def _detect_intel_hybrid() -> CPUTopology:
     """Detect Intel hybrid: P-cores run at higher max freq than E-cores.
     e.g. Core i9-13900K: P-cores ~5800 MHz, E-cores ~4300 MHz."""
+    present = _parse_cpulist_file("/sys/devices/system/cpu/present") or set(range(os.cpu_count() or 1))
     max_freq: dict[int, int] = {}
-    for cpu in range(os.cpu_count() or 1):
+    for cpu in sorted(present):
         path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
         try:
             max_freq[cpu] = int(open(path).read().strip())

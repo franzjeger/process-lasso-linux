@@ -130,8 +130,28 @@ def set_ionice(pid: int, ionice_class: int, ionice_level: int | None = None) -> 
         return False
 
 
+def get_online_cpus() -> set[int]:
+    """Return the set of currently online (non-parked) CPU numbers."""
+    try:
+        text = open("/sys/devices/system/cpu/online").read().strip()
+        return cpulist_to_set(text)
+    except (OSError, ValueError):
+        return set(range(get_cpu_count()))
+
+
 def get_cpu_count() -> int:
-    """Return number of logical CPUs."""
+    """Return total number of logical CPUs, including any currently offline/parked ones.
+
+    Uses /sys/devices/system/cpu/present instead of os.cpu_count() because
+    os.cpu_count() only returns ONLINE CPUs — when Gaming Mode parks cores it
+    returns 16 instead of 32, which breaks the affinity dialog and validation."""
+    try:
+        text = open("/sys/devices/system/cpu/present").read().strip()
+        cpus = cpulist_to_set(text)
+        if cpus:
+            return max(cpus) + 1
+    except (OSError, ValueError):
+        pass
     return os.cpu_count() or 1
 
 
@@ -139,11 +159,11 @@ def validate_cpulist(cpulist: str) -> bool:
     """Check that cpulist string is valid (e.g. '0-3,5,7')."""
     if not cpulist or not cpulist.strip():
         return False
-    cpu_count = get_cpu_count()
+    max_cpu = get_cpu_count() - 1
     try:
         cpus = cpulist_to_set(cpulist)
     except ValueError:
         return False
     if not cpus:
         return False
-    return all(0 <= c < cpu_count for c in cpus)
+    return all(0 <= c <= max_cpu for c in cpus)

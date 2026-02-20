@@ -6,26 +6,38 @@ from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen
 
 
-# Colour stops (Catppuccin Mocha palette)
-_LOW    = QColor("#a6e3a1")   # green   — 0–30%
-_MED    = QColor("#f9e2af")   # yellow  — 30–60%
-_HIGH   = QColor("#fab387")   # orange  — 60–80%
-_CRIT   = QColor("#f38ba8")   # red     — 80–100%
-_BG     = QColor("#181825")   # bar background
-_BORDER = QColor("#313244")   # bar border
-_TEXT   = QColor("#585b70")   # label text (CPU number)
-_ONLINE = QColor("#a6adc8")   # CPU index text (online)
-_OFFLIN = QColor("#45475a")   # CPU index text (offline / parked)
+# Bar background / border — glass purple
+_BG     = QColor(10, 4, 22, 180)      # dark purple glass
+_BORDER = QColor(109, 40, 217, 70)    # subtle purple glow border
+_ONLINE = QColor(196, 181, 253)        # light lavender — CPU index text
+_OFFLIN = QColor(76, 29, 149, 130)    # muted purple — offline label
+
+# Load colour ramp: green → yellow → orange → red (smooth interpolation)
+_RAMP = [
+    (0,   34,  197,  94),   # #22c55e  green
+    (25,  163, 230,  53),   # #a3e635  yellow-green
+    (50,  234, 179,   8),   # #eab308  yellow
+    (70,  249, 115,  22),   # #f97316  orange
+    (85,  239,  68,  68),   # #ef4444  red
+    (100, 220,  38,  38),   # #dc2626  deep red
+]
 
 
 def _bar_color(pct: float) -> QColor:
-    if pct >= 80:
-        return _CRIT
-    if pct >= 60:
-        return _HIGH
-    if pct >= 30:
-        return _MED
-    return _LOW
+    """Smooth interpolated colour across the load ramp."""
+    pct = max(0.0, min(100.0, pct))
+    for i in range(len(_RAMP) - 1):
+        p0, r0, g0, b0 = _RAMP[i]
+        p1, r1, g1, b1 = _RAMP[i + 1]
+        if pct <= p1:
+            t = (pct - p0) / (p1 - p0) if p1 > p0 else 0.0
+            return QColor(
+                int(r0 + t * (r1 - r0)),
+                int(g0 + t * (g1 - g0)),
+                int(b0 + t * (b1 - b0)),
+            )
+    r, g, b = _RAMP[-1][1], _RAMP[-1][2], _RAMP[-1][3]
+    return QColor(r, g, b)
 
 
 class CpuBarsWidget(QWidget):
@@ -100,10 +112,10 @@ class CpuBarsWidget(QWidget):
 
             offline = i in self._offline
 
-            # Background
+            # Background (glass dark purple)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(_BG)
-            p.drawRoundedRect(x, y, bar_w, bar_h, 3, 3)
+            p.drawRoundedRect(x, y, bar_w, bar_h, 4, 4)
 
             # Filled portion (skip for offline CPUs)
             if not offline and pct > 0:
@@ -112,10 +124,10 @@ class CpuBarsWidget(QWidget):
                 p.drawRoundedRect(x + label_w + 1, y + 2,
                                   fill_w, bar_h - 4, 2, 2)
 
-            # Border
+            # Border (purple glow)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(_BORDER, 1))
-            p.drawRoundedRect(x, y, bar_w, bar_h, 3, 3)
+            p.drawRoundedRect(x, y, bar_w, bar_h, 4, 4)
 
             # CPU index label
             p.setPen(_OFFLIN if offline else _ONLINE)
@@ -129,7 +141,7 @@ class CpuBarsWidget(QWidget):
                 p.setPen(_OFFLIN)
             else:
                 pct_text = f"{pct:.0f}%"
-                p.setPen(Qt.GlobalColor.white if pct >= 60 else _ONLINE)
+                p.setPen(QColor(255, 255, 255, 220) if pct >= 50 else _ONLINE)
             p.drawText(x + label_w + 2, y, bar_w - label_w - 4, bar_h,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        pct_text)

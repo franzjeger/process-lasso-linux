@@ -36,8 +36,26 @@ class MainWindow(QMainWindow):
         self._probalance = ProBalance(self._config.get("probalance", {}))
 
         self.setWindowTitle("Process Lasso")
-        self.setMinimumSize(900, 600)
-        self.resize(1100, 700)
+        self.setMinimumSize(860, 620)
+
+        # Scale default window size to available screen real estate
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            w = max(1000, min(1500, int(avail.width() * 0.82)))
+            h = max(700, min(1050, int(avail.height() * 0.84)))
+        else:
+            w, h = 1100, 820
+        self.resize(w, h)
+
+        # WA_TranslucentBackground is intentionally NOT set: toggling it on a
+        # live window is unreliable on X11 and causes content to vanish when
+        # switching to the system theme (window becomes fully transparent).
+
+        # Penguin / Tux icon
+        _tux = "/usr/share/icons/hicolor/scalable/apps/archlinux-kernel-manager-tux.svg"
+        if os.path.exists(_tux):
+            self.setWindowIcon(QIcon(_tux))
 
         self._build_ui()
         self._build_tray()
@@ -71,6 +89,7 @@ class MainWindow(QMainWindow):
             log_callback=self._append_log,
         )
         self._proc_table.rule_add_requested.connect(self._on_rule_add_from_table)
+        self._proc_table.affinity_manually_changed.connect(self._on_affinity_manual_change)
         proc_layout.addWidget(self._proc_table)
 
         self._tabs.addTab(proc_container, "Processes")
@@ -161,6 +180,14 @@ class MainWindow(QMainWindow):
 
     def _on_rules_changed(self):
         self._save_config()
+        # Re-apply rules + default to all running processes so that processes
+        # previously matched by a now-deleted or changed rule don't stay stuck
+        # with a stale affinity.
+        self._monitor.reapply_all_defaults()
+
+    @pyqtSlot(int)
+    def _on_affinity_manual_change(self, pid: int):
+        self._monitor.set_manual_affinity_override(pid, duration_s=30.0)
 
     @pyqtSlot(object)
     def _on_rule_add_from_table(self, rule):
@@ -181,6 +208,10 @@ class MainWindow(QMainWindow):
     @pyqtSlot(bool, bool)
     def _on_gaming_mode_changed(self, active: bool, elevate_nice: bool):
         self._monitor.set_gaming_mode(active, elevate_nice)
+        if active:
+            # Push the default/rule affinities onto all currently running
+            # processes so they immediately use the now-online preferred CPUs.
+            self._monitor.reapply_all_defaults()
 
     @pyqtSlot(dict)
     def _on_settings_changed(self, updated_config: dict):
@@ -189,6 +220,16 @@ class MainWindow(QMainWindow):
         # Re-apply default affinity to all currently running processes immediately
         self._monitor.reapply_all_defaults()
         self._save_config()
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """Switch between custom dark theme and system theme."""
+        use_system = self._config.get("ui", {}).get("use_system_theme", False)
+        if use_system:
+            self._app.setStyleSheet("")
+        else:
+            dark_css = self._app.property("pl_dark_theme_css") or ""
+            self._app.setStyleSheet(dark_css)
 
     def _save_config(self):
         self._config["rules"] = self._rule_engine.to_dict_list()
