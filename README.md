@@ -89,6 +89,12 @@ The detector identifies P-cores (higher max frequency) as preferred and parks E-
 3. Launch your game — it runs on P-cores only, E-cores handle background tasks
 4. Click **Disable Gaming Mode** when done
 
+## Built with AI
+
+This project was built entirely with [Claude](https://claude.ai) (Anthropic). Every line of Python, the GUI, the sysfs integration, the helper binary — all of it was written through a conversation with an AI assistant. No apologies. It works, it's fast, and the purple theme slaps.
+
+If that bothers you, the unpark button is right there.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
