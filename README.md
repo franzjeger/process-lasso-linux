@@ -1,6 +1,18 @@
 # Process Lasso for Linux — CPU affinity manager with Gaming Mode
 
-<!-- screenshot -->
+## Screenshots
+
+| Processes | Gaming Mode |
+|---|---|
+| ![Processes tab](screenshots/processes.png) | ![Gaming Mode tab](screenshots/gaming_mode.png) |
+
+| Rules | ProBalance |
+|---|---|
+| ![Rules tab](screenshots/rules.png) | ![ProBalance tab](screenshots/probalance.png) |
+
+| Settings | Log |
+|---|---|
+| ![Settings tab](screenshots/settings.png) | ![Log tab](screenshots/log.png) |
 
 ## Why it beats Windows Process Lasso on X3D / Hybrid CPUs
 
