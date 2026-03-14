@@ -6,15 +6,15 @@ A KDE/Linux process manager inspired by Windows Process Lasso. Built with Python
 
 | Processes | Gaming Mode |
 |---|---|
-| ![Processes tab](screenshots/processes.png) | ![Gaming Mode tab](screenshots/gaming_mode.png) |
+| ![Processes tab](screenshots/v2/processes.png) | ![Gaming Mode tab](screenshots/v2/gaming_mode.png) |
 
 | Rules | ProBalance |
 |---|---|
-| ![Rules tab](screenshots/rules.png) | ![ProBalance tab](screenshots/probalance.png) |
+| ![Rules tab](screenshots/v2/rules.png) | ![ProBalance tab](screenshots/v2/probalance.png) |
 
 | Settings | Log |
 |---|---|
-| ![Settings tab](screenshots/settings.png) | ![Log tab](screenshots/log.png) |
+| ![Settings tab](screenshots/v2/settings.png) | ![Log tab](screenshots/v2/log.png) |
 
 ---
 
