@@ -44,6 +44,19 @@ def _bar_color(pct: float) -> QColor:
     return QColor(r, g, b)
 
 
+def _read_cpu_freqs(n_cpus: int) -> dict[int, float]:
+    """Read current CPU frequencies in GHz from sysfs scaling_cur_freq."""
+    freqs: dict[int, float] = {}
+    for cpu in range(n_cpus):
+        try:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+            khz = int(open(path).read().strip())
+            freqs[cpu] = khz / 1_000_000.0   # kHz → GHz
+        except (OSError, ValueError):
+            pass
+    return freqs
+
+
 def _read_temps_all(n_cpus: int) -> dict[int, float]:
     """Read per-CPU temperatures from hwmon and /sys topology.
 
@@ -111,6 +124,7 @@ class CpuBarsWidget(QWidget):
         self._cpu_pcts: list[float] = []
         self._offline: set[int] = set()
         self._temps: dict[int, float] = {}
+        self._freqs: dict[int, float] = {}
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMinimumHeight(30)
         self.setMouseTracking(True)
@@ -124,17 +138,21 @@ class CpuBarsWidget(QWidget):
             self._offline = cpu_park.get_offline_cpus()
         except Exception:
             self._offline = set()
-        # Read temperatures
+        # Read temperatures and frequencies
         try:
             self._temps = _read_temps_all(len(self._cpu_pcts))
         except Exception:
             self._temps = {}
+        try:
+            self._freqs = _read_cpu_freqs(len(self._cpu_pcts))
+        except Exception:
+            self._freqs = {}
         self.update()  # triggers paintEvent
         # Resize height to fit the number of rows needed
         n = len(self._cpu_pcts)
         if n == 0:
             return
-        bar_h = 20
+        bar_h = 26
         gap   = 3
         cols  = self._cols(n)
         rows  = (n + cols - 1) // cols
@@ -143,18 +161,33 @@ class CpuBarsWidget(QWidget):
         self.setMaximumHeight(needed)
 
     def _cols(self, n: int) -> int:
-        """Choose number of columns that fill width reasonably."""
+        """Choose number of columns that fill width reasonably with minimal wasted slots."""
         w = self.width() or 900
-        bar_min_w = 90    # minimum bar width including label
-        cols = max(1, w // bar_min_w)
-        return min(cols, n)
+        bar_min_w = 90
+        max_cols = min(max(1, w // bar_min_w), n)
+        lo = max(1, max_cols // 2)
+
+        # First pass: find largest column count (≤ max_cols, ≥ lo) that divides n evenly
+        for c in range(max_cols, lo - 1, -1):
+            if n % c == 0:
+                return c
+
+        # Second pass: no perfect divisor found — minimize wasted slots
+        best_c = max_cols
+        best_waste = (max_cols - n % max_cols) % max_cols
+        for c in range(max_cols - 1, lo - 1, -1):
+            waste = (c - n % c) % c
+            if waste < best_waste:
+                best_waste = waste
+                best_c = c
+        return best_c
 
     def _bar_index_at(self, pos: QPoint) -> int:
         """Return the CPU bar index under the given widget position, or -1."""
         n = len(self._cpu_pcts)
         if n == 0:
             return -1
-        bar_h = 20
+        bar_h = 26
         gap   = 3
         cols  = self._cols(n)
         w     = self.width()
@@ -192,6 +225,9 @@ class CpuBarsWidget(QWidget):
                     tip = f"CPU {idx}: offline (parked)"
                 else:
                     tip = f"CPU {idx}: {pct:.1f}%"
+                    freq = self._freqs.get(idx)
+                    if freq is not None:
+                        tip += f"  |  {freq:.2f} GHz"
                     if temp is not None:
                         tip += f"  |  {temp:.0f}°C"
                 QToolTip.showText(ev.globalPos(), tip, self)
@@ -209,7 +245,7 @@ class CpuBarsWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w     = self.width()
-        bar_h = 20
+        bar_h = 26
         gap   = 3
         cols  = self._cols(n)
         bar_w = max(60, (w - gap * (cols + 1)) // cols)
@@ -218,6 +254,9 @@ class CpuBarsWidget(QWidget):
         font = QFont()
         font.setPixelSize(10)
         font.setFamily("monospace")
+        freq_font = QFont()
+        freq_font.setPixelSize(9)
+        freq_font.setFamily("monospace")
         p.setFont(font)
 
         for i, pct in enumerate(self._cpu_pcts):
@@ -265,16 +304,28 @@ class CpuBarsWidget(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        str(i))
 
-            # Percentage text (right-aligned inside bar)
+            # Percentage text (right-aligned, upper ~16px of bar)
             if offline:
                 pct_text = "off"
                 p.setPen(_OFFLIN)
             else:
                 pct_text = f"{pct:.0f}%"
                 p.setPen(QColor(255, 255, 255, 220) if pct >= 50 else _ONLINE)
-            p.drawText(x + label_w + 2, y, bar_w - label_w - 4, bar_h,
+            p.setFont(font)
+            p.drawText(x + label_w + 2, y, bar_w - label_w - 4, bar_h - 10,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        pct_text)
+
+            # Frequency text (right-aligned, lower 10px of bar)
+            if not offline:
+                freq = self._freqs.get(i)
+                if freq is not None:
+                    p.setFont(freq_font)
+                    p.setPen(QColor(180, 200, 220, 160))
+                    p.drawText(x + label_w + 2, y + bar_h - 11, bar_w - label_w - 4, 11,
+                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                               f"{freq:.2f}G")
+                    p.setFont(font)
 
         p.end()
 

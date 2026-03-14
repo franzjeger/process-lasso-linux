@@ -47,6 +47,9 @@ class AffinityDialog(QDialog):
 
         preferred   = set(topo.preferred)     if (topo and topo.has_asymmetry) else set()
         non_pref    = set(topo.non_preferred)  if (topo and topo.has_asymmetry) else set()
+        self._preferred = preferred
+        self._non_pref  = non_pref
+        self._smt_siblings = smt_siblings
 
         # cb_map[cpu] = QCheckBox for that CPU
         cb_map: dict[int, QCheckBox] = {}
@@ -131,6 +134,35 @@ class AffinityDialog(QDialog):
         none_btn.clicked.connect(self._select_none)
         btn_row.addWidget(all_btn)
         btn_row.addWidget(none_btn)
+
+        if preferred and non_pref:
+            from cpu_park import TopologyKind
+            if topo and topo.kind == TopologyKind.AMD_X3D:
+                ccd0_label, ccd1_label = "CCD0 (V-Cache)", "CCD1"
+            else:
+                ccd0_label, ccd1_label = "Preferred CCD", "Non-preferred CCD"
+
+            sep = QLabel("|")
+            sep.setStyleSheet("color: rgba(255,255,255,0.3); margin: 0 4px;")
+            btn_row.addWidget(sep)
+
+            ccd0_btn = QPushButton(ccd0_label)
+            ccd0_btn.setToolTip(f"Select only {ccd0_label} CPUs: {sorted(preferred)}")
+            ccd0_btn.clicked.connect(lambda: self._select_set(preferred))
+            btn_row.addWidget(ccd0_btn)
+
+            ccd1_btn = QPushButton(ccd1_label)
+            ccd1_btn.setToolTip(f"Select only {ccd1_label} CPUs: {sorted(non_pref)}")
+            ccd1_btn.clicked.connect(lambda: self._select_set(non_pref))
+            btn_row.addWidget(ccd1_btn)
+
+            ccd0_phys = preferred - smt_siblings
+            if ccd0_phys != preferred:
+                ccd0p_btn = QPushButton(f"{ccd0_label} (no SMT)")
+                ccd0p_btn.setToolTip(f"Select only physical cores of {ccd0_label}: {sorted(ccd0_phys)}")
+                ccd0p_btn.clicked.connect(lambda: self._select_set(ccd0_phys))
+                btn_row.addWidget(ccd0p_btn)
+
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -170,6 +202,11 @@ class AffinityDialog(QDialog):
         for cb in self._checkboxes:
             if cb.isEnabled():
                 cb.setChecked(False)
+
+    def _select_set(self, cpus: set[int]):
+        for i, cb in enumerate(self._checkboxes):
+            if cb.isEnabled():
+                cb.setChecked(i in cpus)
 
     def _validate_and_accept(self):
         selected = [i for i, cb in enumerate(self._checkboxes) if cb.isChecked()]
@@ -335,7 +372,7 @@ class ProcessPickerDialog(QDialog):
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._table.doubleClicked.connect(self.accept)
+        self._table.doubleClicked.connect(self._on_accept)
         layout.addWidget(self._table)
 
         self._all_rows: list[tuple] = []  # (pid, name, cpu, affinity)
@@ -436,8 +473,18 @@ class RuleEditDialog(QDialog):
         for label in ["contains", "exact", "regex"]:
             self._match_combo.addItem(label)
 
-        self._affinity_edit = QLineEdit()
-        self._affinity_edit.setPlaceholderText("e.g. 0-3,5 (leave blank to skip)")
+        # CPU affinity — enable checkbox + read-only display + picker button
+        self._affinity_cb = QCheckBox("Enable")
+        self._affinity_display = QLineEdit()
+        self._affinity_display.setReadOnly(True)
+        self._affinity_display.setEnabled(False)
+        self._affinity_display.setPlaceholderText("no affinity set")
+        self._affinity_display.setMaximumWidth(160)
+        self._affinity_pick_btn = QPushButton("Pick CPUs…")
+        self._affinity_pick_btn.setEnabled(False)
+        self._affinity_pick_btn.clicked.connect(self._pick_affinity)
+        self._affinity_cb.toggled.connect(self._affinity_display.setEnabled)
+        self._affinity_cb.toggled.connect(self._affinity_pick_btn.setEnabled)
 
         self._nice_cb = QCheckBox("Enable")
         self._nice_spin = QSpinBox()
@@ -459,10 +506,16 @@ class RuleEditDialog(QDialog):
         self._enabled_cb = QCheckBox("Rule enabled")
         self._enabled_cb.setChecked(True)
 
+        affinity_row = QHBoxLayout()
+        affinity_row.addWidget(self._affinity_cb)
+        affinity_row.addWidget(self._affinity_display)
+        affinity_row.addWidget(self._affinity_pick_btn)
+        affinity_row.addStretch()
+
         form.addRow("Name:", self._name_edit)
         form.addRow("Pattern:", self._pattern_edit)
         form.addRow("Match type:", self._match_combo)
-        form.addRow("CPU Affinity:", self._affinity_edit)
+        form.addRow("CPU Affinity:", affinity_row)
 
         nice_row = QHBoxLayout()
         nice_row.addWidget(self._nice_cb)
@@ -496,7 +549,8 @@ class RuleEditDialog(QDialog):
             if idx >= 0:
                 self._match_combo.setCurrentIndex(idx)
             if self._rule.affinity:
-                self._affinity_edit.setText(self._rule.affinity)
+                self._affinity_cb.setChecked(True)
+                self._affinity_display.setText(self._rule.affinity)
             if self._rule.nice is not None:
                 self._nice_cb.setChecked(True)
                 self._nice_spin.setValue(self._rule.nice)
@@ -510,6 +564,13 @@ class RuleEditDialog(QDialog):
                 if self._rule.ionice_level is not None:
                     self._ionice_level_spin.setValue(self._rule.ionice_level)
             self._enabled_cb.setChecked(self._rule.enabled)
+
+    def _pick_affinity(self):
+        """Open topology-aware CPU picker and store result in the display field."""
+        current = self._affinity_display.text().strip()
+        dlg = AffinityDialog(current_affinity=current, parent=self)
+        if dlg.exec() == AffinityDialog.DialogCode.Accepted:
+            self._affinity_display.setText(dlg.get_cpulist())
 
     def _pick_process(self):
         """Open live process picker and auto-fill name/pattern from selection."""
@@ -525,8 +586,11 @@ class RuleEditDialog(QDialog):
                 if idx >= 0:
                     self._match_combo.setCurrentIndex(idx)
                 # Pre-fill affinity from the selected process if not already set
-                if not self._affinity_edit.text():
-                    self._affinity_edit.setText(dlg.get_selected_affinity())
+                if not self._affinity_cb.isChecked():
+                    aff = dlg.get_selected_affinity()
+                    if aff:
+                        self._affinity_cb.setChecked(True)
+                        self._affinity_display.setText(aff)
 
     def _validate_and_accept(self):
         import re
@@ -541,10 +605,6 @@ class RuleEditDialog(QDialog):
             except re.error as exc:
                 QMessageBox.warning(self, "Validation", f"Invalid regular expression:\n{exc}")
                 return
-        affinity = self._affinity_edit.text().strip()
-        if affinity and not utils.validate_cpulist(affinity):
-            QMessageBox.warning(self, "Validation", f"Invalid CPU affinity format: '{affinity}'")
-            return
         self.accept()
 
     def get_rule(self):
@@ -554,7 +614,7 @@ class RuleEditDialog(QDialog):
         from rules import Rule
 
         rule_id = self._rule.rule_id if self._rule else None
-        affinity = self._affinity_edit.text().strip() or None
+        affinity = self._affinity_display.text().strip() if self._affinity_cb.isChecked() else None
         nice = self._nice_spin.value() if self._nice_cb.isChecked() else None
         ionice_class = self._ionice_class_combo.currentData() if self._ionice_cb.isChecked() else None
         ionice_level = self._ionice_level_spin.value() if self._ionice_cb.isChecked() else None
@@ -701,6 +761,109 @@ class SteamGamePickerDialog(QDialog):
     def get_selection(self) -> tuple[str, str]:
         """Return (appid, name) of the selected game."""
         return self._appid, self._name
+
+
+# ── Lutris game picker ─────────────────────────────────────────────────────────
+
+class LutrisGamePickerDialog(QDialog):
+    """Browse the local Lutris game database and pick a game to launch."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pick Lutris Game")
+        self.setMinimumSize(560, 480)
+        self._slug: str = ""
+        self._name: str = ""
+        self._all_rows: list[tuple[str, str]] = []   # (slug, name)
+        self._build_ui()
+        QTimer.singleShot(0, self._scan_library)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Filter:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Type to filter games…")
+        self._search.textChanged.connect(self._filter)
+        search_row.addWidget(self._search)
+        layout.addLayout(search_row)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Name", "Runner / Slug"])
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.doubleClicked.connect(self._on_accept)
+        layout.addWidget(self._table)
+
+        self._status = QLabel("Scanning Lutris database…")
+        self._status.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(self._status)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _scan_library(self):
+        import sqlite3
+        db_path = os.path.expanduser("~/.local/share/lutris/pga.db")
+        if not os.path.exists(db_path):
+            self._status.setText("Lutris database not found — is Lutris installed?")
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                "SELECT name, slug, runner FROM games WHERE installed=1 ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            self._status.setText(f"Could not read Lutris database: {e}")
+            return
+        self._all_rows = [(slug, f"{name}  [{runner}]") for name, slug, runner in rows]
+        self._render_rows(self._all_rows)
+        self._status.setText(f"{len(self._all_rows)} installed games found")
+
+    def _render_rows(self, rows: list[tuple[str, str]]):
+        self._table.setRowCount(len(rows))
+        for r, (slug, label) in enumerate(rows):
+            name = label.split("  [")[0]
+            self._table.setItem(r, 0, QTableWidgetItem(name))
+            self._table.setItem(r, 1, QTableWidgetItem(label.split("  [")[1].rstrip("]") if "  [" in label else slug))
+
+    def _filter(self, text: str):
+        text = text.lower()
+        filtered = [(s, l) for s, l in self._all_rows if text in l.lower()]
+        self._render_rows(filtered)
+
+    def _on_accept(self):
+        row = self._table.currentRow()
+        if row < 0:
+            return
+        # Find slug from filtered list
+        name_item = self._table.item(row, 0)
+        if not name_item:
+            return
+        name = name_item.text()
+        # Match back to slug
+        for slug, label in self._all_rows:
+            if label.startswith(name + "  [") or label == name:
+                self._slug = slug
+                self._name = name
+                break
+        else:
+            self._name = name
+            self._slug = name.lower().replace(" ", "-")
+        self.accept()
+
+    def get_selection(self) -> tuple[str, str]:
+        """Return (slug, name) of the selected game."""
+        return self._slug, self._name
 
 
 # ── Rule presets ───────────────────────────────────────────────────────────────

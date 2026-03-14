@@ -56,11 +56,11 @@ class GamingModeTab(QWidget):
         self._preferred_cbs: dict[int, QCheckBox] = {}
         self._smt_siblings: set[int] = set()
         # Launcher / auto-restore state
-        self._launched_appid: str = ""
         self._launched_name: str = ""
         self._launched_pid: int | None = None
         self._watch_phase: str = "idle"   # idle | waiting | running
         self._watch_timer: QTimer | None = None
+        self._pending_enable_after_unpark: bool = False
         self._build_ui()
         self._detect_topology()
 
@@ -187,39 +187,64 @@ class GamingModeTab(QWidget):
         reset_layout.addWidget(reset_btn)
         layout.addWidget(reset_group)
 
-        # ── Profiles ──────────────────────────────────────────────────────
-        profile_group = QGroupBox("Gaming Mode Profiles")
-        profile_layout = QHBoxLayout(profile_group)
-        profile_layout.addWidget(QLabel("Profile:"))
-        self._profile_combo = QComboBox()
-        self._profile_combo.setMinimumWidth(160)
-        profile_layout.addWidget(self._profile_combo)
-        save_profile_btn = QPushButton("Save")
-        load_profile_btn = QPushButton("Load")
-        del_profile_btn  = QPushButton("Delete")
-        save_profile_btn.clicked.connect(self._save_profile)
-        load_profile_btn.clicked.connect(self._load_profile)
-        del_profile_btn.clicked.connect(self._delete_profile)
-        for b in [save_profile_btn, load_profile_btn, del_profile_btn]:
-            profile_layout.addWidget(b)
-        profile_layout.addStretch()
-        layout.addWidget(profile_group)
-        self._refresh_profiles_combo()
-
-        # ── Steam Game Launcher ────────────────────────────────────────────
+        # ── Game Launcher (with integrated profiles) ───────────────────────
         launcher_group = QGroupBox("Game Launcher")
         launcher_layout = QVBoxLayout(launcher_group)
 
-        picker_row = QHBoxLayout()
-        self._game_label = QLabel("No game selected")
-        self._game_label.setStyleSheet("color: #aaa;")
-        picker_row.addWidget(self._game_label)
-        pick_game_btn = QPushButton("▼ Pick Steam Game…")
-        pick_game_btn.clicked.connect(self._pick_steam_game)
-        picker_row.addWidget(pick_game_btn)
-        picker_row.addStretch()
-        launcher_layout.addLayout(picker_row)
+        # Profile row
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(160)
+        self._profile_combo.setToolTip(
+            "Selecting a profile instantly restores the game name,\n"
+            "launch command, and CPU parking settings saved with it."
+        )
+        profile_row.addWidget(self._profile_combo)
+        save_profile_btn = QPushButton("Save")
+        save_profile_btn.setToolTip("Save current game name, command, and CPU settings as a named profile")
+        del_profile_btn  = QPushButton("Delete")
+        save_profile_btn.clicked.connect(self._save_profile)
+        del_profile_btn.clicked.connect(self._delete_profile)
+        for b in [save_profile_btn, del_profile_btn]:
+            profile_row.addWidget(b)
+        profile_row.addStretch()
+        launcher_layout.addLayout(profile_row)
 
+        # Game name + source pickers
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Game:"))
+        self._game_name_edit = QLineEdit()
+        self._game_name_edit.setPlaceholderText("Game name (used to detect running process)")
+        self._game_name_edit.textChanged.connect(self._on_game_fields_changed)
+        name_row.addWidget(self._game_name_edit)
+        pick_steam_btn = QPushButton("Steam…")
+        pick_steam_btn.setToolTip("Browse your Steam library")
+        pick_steam_btn.clicked.connect(self._pick_steam_game)
+        pick_lutris_btn = QPushButton("Lutris…")
+        pick_lutris_btn.setToolTip("Browse your Lutris library")
+        pick_lutris_btn.clicked.connect(self._pick_lutris_game)
+        name_row.addWidget(pick_steam_btn)
+        name_row.addWidget(pick_lutris_btn)
+        launcher_layout.addLayout(name_row)
+
+        # Launch command
+        cmd_row = QHBoxLayout()
+        cmd_row.addWidget(QLabel("Command:"))
+        self._cmd_edit = QLineEdit()
+        self._cmd_edit.setPlaceholderText(
+            "e.g.  steam -applaunch 238960   or   lutris lutris:rungame/slug   or   /path/to/game"
+        )
+        self._cmd_edit.setToolTip(
+            "Any shell command to launch the game.\n"
+            "The Steam and Lutris picker buttons fill this in automatically.\n"
+            "You can also type or paste any command here."
+        )
+        self._cmd_edit.textChanged.connect(self._on_game_fields_changed)
+        cmd_row.addWidget(self._cmd_edit)
+        launcher_layout.addLayout(cmd_row)
+
+        # Launch + auto-restore
         launch_row = QHBoxLayout()
         self._launch_btn = QPushButton("▶  Launch")
         self._launch_btn.setEnabled(False)
@@ -253,6 +278,8 @@ class GamingModeTab(QWidget):
         launcher_layout.addLayout(kill_row)
 
         layout.addWidget(launcher_group)
+        self._refresh_profiles_combo()
+        self._profile_combo.currentTextChanged.connect(self._load_profile)
 
         # ── Log ───────────────────────────────────────────────────────────
         self._log = QTextEdit()
@@ -424,6 +451,10 @@ class GamingModeTab(QWidget):
         self.log_message.emit("[Gaming Mode] disabled")
         # Refresh topology + checkbox grid now that all CPUs are back online
         self._detect_topology()
+        # Profile load requested a re-enable after unpark
+        if self._pending_enable_after_unpark:
+            self._pending_enable_after_unpark = False
+            self._enable_gaming_mode()
 
     def _reset_all(self):
         ans = QMessageBox.question(
@@ -456,36 +487,73 @@ class GamingModeTab(QWidget):
         self.reset_requested.emit()
 
     # ── Profiles ──────────────────────────────────────────────────────────
+    # A profile stores the complete game launch configuration:
+    #   game_name  — display name / process-watch name
+    #   command    — the shell command used to launch the game
+    #   cpu_states — dict of str(cpu_index) → bool (which preferred CPUs to keep online)
+    #   elevate_nice — whether to enable nice -1 elevation
 
-    def _refresh_profiles_combo(self):
+    def _refresh_profiles_combo(self, select: str = ""):
+        self._profile_combo.blockSignals(True)
         self._profile_combo.clear()
         profiles = self._config.get("gaming_mode", {}).get("profiles", {})
         for name in sorted(profiles):
             self._profile_combo.addItem(name)
+        if select:
+            idx = self._profile_combo.findText(select)
+            if idx >= 0:
+                self._profile_combo.setCurrentIndex(idx)
+        self._profile_combo.blockSignals(False)
 
     def _save_profile(self):
-        name, ok = QInputDialog.getText(self, "Save Profile", "Profile name:")
+        # Default the profile name to the current game name
+        default = self._game_name_edit.text().strip() or ""
+        name, ok = QInputDialog.getText(
+            self, "Save Profile", "Profile name:", text=default
+        )
         if not ok or not name.strip():
             return
         name = name.strip()
-        state = {
-            cpu: cb.isChecked()
-            for cpu, cb in self._preferred_cbs.items()
+        profile = {
+            "game_name":    self._game_name_edit.text().strip(),
+            "command":      self._cmd_edit.text().strip(),
+            "cpu_states":   {str(cpu): cb.isChecked() for cpu, cb in self._preferred_cbs.items()},
+            "elevate_nice": self._nice_cb.isChecked(),
         }
-        self._config.setdefault("gaming_mode", {}).setdefault("profiles", {})[name] = state
+        self._config.setdefault("gaming_mode", {}).setdefault("profiles", {})[name] = profile
         self.config_changed.emit(self._config)
-        self._refresh_profiles_combo()
-        idx = self._profile_combo.findText(name)
-        if idx >= 0:
-            self._profile_combo.setCurrentIndex(idx)
+        self._refresh_profiles_combo(select=name)
+        self._append_log(f"[Profile] Saved '{name}' → {profile['command']}")
 
     def _load_profile(self):
         name = self._profile_combo.currentText()
         if not name:
             return
-        state = self._config.get("gaming_mode", {}).get("profiles", {}).get(name, {})
+        profile = self._config.get("gaming_mode", {}).get("profiles", {}).get(name)
+        if not profile:
+            self._append_log(f"[Profile] '{name}' not found.")
+            return
+
+        # Restore game name + command
+        self._game_name_edit.setText(profile.get("game_name", ""))
+        self._cmd_edit.setText(profile.get("command", ""))
+
+        # Restore nice preference
+        if "elevate_nice" in profile:
+            self._nice_cb.setChecked(profile["elevate_nice"])
+
+        # Restore CPU checkbox states (keys stored as strings)
+        cpu_states = profile.get("cpu_states", {})
         for cpu, cb in self._preferred_cbs.items():
-            cb.setChecked(state.get(cpu, True))
+            cb.setChecked(cpu_states.get(str(cpu), cpu_states.get(cpu, True)))
+
+        self._append_log(f"[Profile] Loaded '{name}' — {profile.get('command', '?')}")
+
+        # If gaming mode is already active, re-apply parking with the restored CPU selection
+        if self._parked:
+            self._append_log(f"[Profile] Re-applying CPU parking for '{name}'…")
+            self._disable_gaming_mode()
+            self._pending_enable_after_unpark = True
 
     def _delete_profile(self):
         name = self._profile_combo.currentText()
@@ -501,7 +569,13 @@ class GamingModeTab(QWidget):
         self.config_changed.emit(self._config)
         self._refresh_profiles_combo()
 
-    # ── Steam Launcher ─────────────────────────────────────────────────────
+    # ── Launcher helpers ────────────────────────────────────────────────────
+
+    def _on_game_fields_changed(self):
+        """Enable Launch button when both name and command are non-empty."""
+        has_name = bool(self._game_name_edit.text().strip())
+        has_cmd  = bool(self._cmd_edit.text().strip())
+        self._launch_btn.setEnabled(has_name and has_cmd)
 
     def _pick_steam_game(self):
         from gui.dialogs import SteamGamePickerDialog
@@ -509,30 +583,44 @@ class GamingModeTab(QWidget):
         if dlg.exec() == SteamGamePickerDialog.DialogCode.Accepted:
             appid, name = dlg.get_selection()
             if appid:
-                self._launched_appid = appid
-                self._launched_name = name
-                self._game_label.setText(f"{name}  (AppID {appid})")
-                self._game_label.setStyleSheet("color: #eff0f1;")
-                self._launch_btn.setEnabled(True)
+                self._game_name_edit.setText(name)
+                self._cmd_edit.setText(f"steam -applaunch {appid}")
+
+    def _pick_lutris_game(self):
+        from gui.dialogs import LutrisGamePickerDialog
+        dlg = LutrisGamePickerDialog(self)
+        if dlg.exec() == LutrisGamePickerDialog.DialogCode.Accepted:
+            slug, name = dlg.get_selection()
+            if slug:
+                self._game_name_edit.setText(name)
+                self._cmd_edit.setText(f"lutris lutris:rungame/{slug}")
 
     def _launch_with_gaming_mode(self):
-        if not self._launched_appid:
+        cmd = self._cmd_edit.text().strip()
+        name = self._game_name_edit.text().strip()
+        if not cmd or not name:
             return
         if not self._parked:
             self._enable_gaming_mode()
-        self._append_log(f"[Launcher] Launching {self._launched_name} (AppID {self._launched_appid})…")
+        self._launched_name = name
+        self._append_log(f"[Launcher] Launching '{name}': {cmd}")
         self._watch_phase = "waiting"
         self._launched_pid = None
         self._watch_status_label.setText("Waiting for game process…")
         self._kill_game_btn.setEnabled(True)
 
+        import shlex
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            parts = cmd.split()
         proc = QProcess(self)
-        proc.setProgram("steam")
-        proc.setArguments(["-applaunch", self._launched_appid])
+        proc.setProgram(parts[0])
+        proc.setArguments(parts[1:])
         proc.finished.connect(self._on_launcher_exited)
         proc.start()
 
-        # Start polling timer — steam -applaunch exits in ~1s, real game appears later
+        # Start polling timer — launcher command often exits in ~1s, real game appears after
         if self._watch_timer:
             self._watch_timer.stop()
         self._watch_timer = QTimer(self)
@@ -545,9 +633,37 @@ class GamingModeTab(QWidget):
         # steam -applaunch exits immediately; real game is a child process
         self._append_log(f"[Launcher] steam process exited (code {exit_code}) — watching /proc for game…")
 
+    @staticmethod
+    def _proc_name_matches(game_name: str, pid: int) -> bool:
+        """Return True if the process at *pid* looks like it matches *game_name*.
+
+        Normalises both sides by lowercasing and stripping all non-alphanumeric
+        characters so that "Path of Exile" matches comm "PathOfExile" (or the
+        15-char truncated variant).  Falls back to checking /proc/pid/cmdline.
+        """
+        import re
+        def norm(s: str) -> str:
+            return re.sub(r'[^a-z0-9]', '', s.lower())
+
+        name_n = norm(game_name)
+        try:
+            comm = open(f"/proc/{pid}/comm").read().strip()
+            comm_n = norm(comm)
+            if name_n in comm_n or comm_n in name_n:
+                return True
+        except OSError:
+            return False
+        # Secondary check: cmdline (handles Proton/Wine wrappers that forward the game exe)
+        try:
+            cmdline = open(f"/proc/{pid}/cmdline").read().replace('\x00', ' ')
+            if name_n in norm(cmdline):
+                return True
+        except OSError:
+            pass
+        return False
+
     def _poll_game_process(self):
         """Poll /proc every 2s for the launched game process."""
-        game_name_lower = self._launched_name.lower()
         try:
             pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
         except OSError:
@@ -556,24 +672,38 @@ class GamingModeTab(QWidget):
         if self._watch_phase == "waiting":
             # Look for a process matching the game name
             for pid in pids:
-                try:
-                    comm = open(f"/proc/{pid}/comm").read().strip().lower()
-                    if game_name_lower in comm or comm in game_name_lower:
-                        self._launched_pid = pid
-                        self._watch_phase = "running"
-                        self._watch_status_label.setText(f"Game running (PID {pid})")
-                        self._append_log(f"[Launcher] Game process found: PID {pid} ({comm})")
-                        # Slow down poll interval once running
-                        if self._watch_timer:
-                            self._watch_timer.setInterval(5000)
-                        return
-                except OSError:
-                    continue
+                if self._proc_name_matches(self._launched_name, pid):
+                    try:
+                        comm = open(f"/proc/{pid}/comm").read().strip()
+                    except OSError:
+                        comm = "?"
+                    self._launched_pid = pid
+                    self._watch_phase = "running"
+                    self._watch_status_label.setText(f"Game running (PID {pid})")
+                    self._append_log(f"[Launcher] Game process found: PID {pid} ({comm})")
+                    # Slow down poll interval once running
+                    if self._watch_timer:
+                        self._watch_timer.setInterval(5000)
+                    return
 
         elif self._watch_phase == "running":
-            # Check if the game process is still alive
+            # Check if the tracked process is still alive
             if self._launched_pid and self._launched_pid not in pids:
-                # Process exited
+                # Original PID gone — check if a matching process is still running
+                # (handles games that restart themselves or have multiple stages)
+                replacement = next(
+                    (p for p in pids if self._proc_name_matches(self._launched_name, p)),
+                    None,
+                )
+                if replacement:
+                    self._launched_pid = replacement
+                    try:
+                        comm = open(f"/proc/{replacement}/comm").read().strip()
+                    except OSError:
+                        comm = "?"
+                    self._append_log(f"[Launcher] Game PID changed → {replacement} ({comm})")
+                    return
+                # No matching process found — game has exited
                 self._append_log(f"[Launcher] Game process (PID {self._launched_pid}) exited.")
                 if self._auto_restore_cb.isChecked():
                     self._stop_watch(restore=True)

@@ -52,8 +52,9 @@ class MainWindow(QMainWindow):
         # App icon
         _icon_path = "/usr/share/icons/hicolor/scalable/apps/process-lasso-linux.svg"
         if os.path.exists(_icon_path):
-            _app_icon = QIcon.fromTheme("utilities-system-monitor")
-            self.setWindowIcon(QIcon(_icon_path))
+            _icon = QIcon(_icon_path)
+            self.setWindowIcon(_icon)
+            self._app.setWindowIcon(_icon)
 
         self._build_ui()
         self._build_tray()
@@ -164,7 +165,10 @@ class MainWindow(QMainWindow):
 
     def _build_tray(self):
         self._tray = QSystemTrayIcon(self)
-        self._tray.setIcon(self._app.windowIcon())
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QIcon.fromTheme("utilities-system-monitor")
+        self._tray.setIcon(icon)
         self._tray.setToolTip("Process Lasso")
 
         menu = QMenu()
