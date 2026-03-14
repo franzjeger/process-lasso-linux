@@ -1,17 +1,17 @@
-"""Gaming Mode tab: CPU parking + reset all changes."""
+"""Gaming Mode tab: CPU parking + profiles + Steam launcher + auto-restore."""
 from __future__ import annotations
 
-import sys
 import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QTextEdit, QCheckBox, QMessageBox, QFrame,
-    QInputDialog, QLineEdit, QGridLayout, QScrollArea,
+    QInputDialog, QLineEdit, QGridLayout, QScrollArea, QComboBox,
 )
-from PyQt6.QtCore import pyqtSignal, QThread, QObject, pyqtSlot, Qt
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import pyqtSignal, QThread, QObject, pyqtSlot, Qt, QTimer, QProcess
+from PyQt6.QtGui import QFont
 
 import cpu_park
 
@@ -45,14 +45,22 @@ class GamingModeTab(QWidget):
     reset_requested    = pyqtSignal()           # → MonitorThread.reset_all_affinities()
     log_message        = pyqtSignal(str)
     gaming_mode_changed = pyqtSignal(bool, bool)  # active, elevate_nice → MonitorThread.set_gaming_mode()
+    config_changed     = pyqtSignal(dict)       # emitted when gaming profiles are saved/deleted
 
-    def __init__(self, parent=None):
+    def __init__(self, config: dict = None, parent=None):
         super().__init__(parent)
+        self._config = config or {}
         self._topo = None
         self._parked = False
         self._worker = None
         self._preferred_cbs: dict[int, QCheckBox] = {}
         self._smt_siblings: set[int] = set()
+        # Launcher / auto-restore state
+        self._launched_appid: str = ""
+        self._launched_name: str = ""
+        self._launched_pid: int | None = None
+        self._watch_phase: str = "idle"   # idle | waiting | running
+        self._watch_timer: QTimer | None = None
         self._build_ui()
         self._detect_topology()
 
@@ -115,9 +123,6 @@ class GamingModeTab(QWidget):
         all_btn  = QPushButton("All")
         self._no_smt_btn = QPushButton("No SMT (physical only)")
         none_btn = QPushButton("None")
-        all_btn.setMaximumWidth(60)
-        self._no_smt_btn.setMaximumWidth(160)
-        none_btn.setMaximumWidth(60)
         all_btn.clicked.connect(lambda: self._select_preferred("all"))
         self._no_smt_btn.clicked.connect(lambda: self._select_preferred("no_smt"))
         none_btn.clicked.connect(lambda: self._select_preferred("none"))
@@ -181,6 +186,73 @@ class GamingModeTab(QWidget):
         reset_btn.clicked.connect(self._reset_all)
         reset_layout.addWidget(reset_btn)
         layout.addWidget(reset_group)
+
+        # ── Profiles ──────────────────────────────────────────────────────
+        profile_group = QGroupBox("Gaming Mode Profiles")
+        profile_layout = QHBoxLayout(profile_group)
+        profile_layout.addWidget(QLabel("Profile:"))
+        self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(160)
+        profile_layout.addWidget(self._profile_combo)
+        save_profile_btn = QPushButton("Save")
+        load_profile_btn = QPushButton("Load")
+        del_profile_btn  = QPushButton("Delete")
+        save_profile_btn.clicked.connect(self._save_profile)
+        load_profile_btn.clicked.connect(self._load_profile)
+        del_profile_btn.clicked.connect(self._delete_profile)
+        for b in [save_profile_btn, load_profile_btn, del_profile_btn]:
+            profile_layout.addWidget(b)
+        profile_layout.addStretch()
+        layout.addWidget(profile_group)
+        self._refresh_profiles_combo()
+
+        # ── Steam Game Launcher ────────────────────────────────────────────
+        launcher_group = QGroupBox("Game Launcher")
+        launcher_layout = QVBoxLayout(launcher_group)
+
+        picker_row = QHBoxLayout()
+        self._game_label = QLabel("No game selected")
+        self._game_label.setStyleSheet("color: #aaa;")
+        picker_row.addWidget(self._game_label)
+        pick_game_btn = QPushButton("▼ Pick Steam Game…")
+        pick_game_btn.clicked.connect(self._pick_steam_game)
+        picker_row.addWidget(pick_game_btn)
+        picker_row.addStretch()
+        launcher_layout.addLayout(picker_row)
+
+        launch_row = QHBoxLayout()
+        self._launch_btn = QPushButton("▶  Launch")
+        self._launch_btn.setEnabled(False)
+        self._launch_btn.setMinimumHeight(36)
+        font2 = QFont()
+        font2.setBold(True)
+        self._launch_btn.setFont(font2)
+        self._launch_btn.clicked.connect(self._launch_with_gaming_mode)
+        launch_row.addWidget(self._launch_btn)
+
+        self._auto_restore_cb = QCheckBox("Auto-disable Gaming Mode when game exits")
+        self._auto_restore_cb.setChecked(True)
+        self._auto_restore_cb.setToolTip(
+            "Watches /proc for the launched game process.\n"
+            "When the game exits, Gaming Mode is automatically disabled\n"
+            "and all parked CPUs come back online."
+        )
+        launch_row.addWidget(self._auto_restore_cb)
+        launch_row.addStretch()
+        launcher_layout.addLayout(launch_row)
+
+        kill_row = QHBoxLayout()
+        self._kill_game_btn = QPushButton("⏹ Kill Game")
+        self._kill_game_btn.setEnabled(False)
+        self._kill_game_btn.clicked.connect(self._kill_launched)
+        kill_row.addWidget(self._kill_game_btn)
+        self._watch_status_label = QLabel("")
+        self._watch_status_label.setStyleSheet("color: #a6e3a1;")
+        kill_row.addWidget(self._watch_status_label)
+        kill_row.addStretch()
+        launcher_layout.addLayout(kill_row)
+
+        layout.addWidget(launcher_group)
 
         # ── Log ───────────────────────────────────────────────────────────
         self._log = QTextEdit()
@@ -383,6 +455,154 @@ class GamingModeTab(QWidget):
         # Restore per-process affinities via monitor
         self.reset_requested.emit()
 
+    # ── Profiles ──────────────────────────────────────────────────────────
+
+    def _refresh_profiles_combo(self):
+        self._profile_combo.clear()
+        profiles = self._config.get("gaming_mode", {}).get("profiles", {})
+        for name in sorted(profiles):
+            self._profile_combo.addItem(name)
+
+    def _save_profile(self):
+        name, ok = QInputDialog.getText(self, "Save Profile", "Profile name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        state = {
+            cpu: cb.isChecked()
+            for cpu, cb in self._preferred_cbs.items()
+        }
+        self._config.setdefault("gaming_mode", {}).setdefault("profiles", {})[name] = state
+        self.config_changed.emit(self._config)
+        self._refresh_profiles_combo()
+        idx = self._profile_combo.findText(name)
+        if idx >= 0:
+            self._profile_combo.setCurrentIndex(idx)
+
+    def _load_profile(self):
+        name = self._profile_combo.currentText()
+        if not name:
+            return
+        state = self._config.get("gaming_mode", {}).get("profiles", {}).get(name, {})
+        for cpu, cb in self._preferred_cbs.items():
+            cb.setChecked(state.get(cpu, True))
+
+    def _delete_profile(self):
+        name = self._profile_combo.currentText()
+        if not name:
+            return
+        ans = QMessageBox.question(
+            self, "Delete Profile", f"Delete profile '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._config.get("gaming_mode", {}).get("profiles", {}).pop(name, None)
+        self.config_changed.emit(self._config)
+        self._refresh_profiles_combo()
+
+    # ── Steam Launcher ─────────────────────────────────────────────────────
+
+    def _pick_steam_game(self):
+        from gui.dialogs import SteamGamePickerDialog
+        dlg = SteamGamePickerDialog(self)
+        if dlg.exec() == SteamGamePickerDialog.DialogCode.Accepted:
+            appid, name = dlg.get_selection()
+            if appid:
+                self._launched_appid = appid
+                self._launched_name = name
+                self._game_label.setText(f"{name}  (AppID {appid})")
+                self._game_label.setStyleSheet("color: #eff0f1;")
+                self._launch_btn.setEnabled(True)
+
+    def _launch_with_gaming_mode(self):
+        if not self._launched_appid:
+            return
+        if not self._parked:
+            self._enable_gaming_mode()
+        self._append_log(f"[Launcher] Launching {self._launched_name} (AppID {self._launched_appid})…")
+        self._watch_phase = "waiting"
+        self._launched_pid = None
+        self._watch_status_label.setText("Waiting for game process…")
+        self._kill_game_btn.setEnabled(True)
+
+        proc = QProcess(self)
+        proc.setProgram("steam")
+        proc.setArguments(["-applaunch", self._launched_appid])
+        proc.finished.connect(self._on_launcher_exited)
+        proc.start()
+
+        # Start polling timer — steam -applaunch exits in ~1s, real game appears later
+        if self._watch_timer:
+            self._watch_timer.stop()
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(2000)
+        self._watch_timer.timeout.connect(self._poll_game_process)
+        self._watch_timer.start()
+
+    @pyqtSlot(int, QProcess.ExitStatus)
+    def _on_launcher_exited(self, exit_code: int, exit_status: QProcess.ExitStatus):
+        # steam -applaunch exits immediately; real game is a child process
+        self._append_log(f"[Launcher] steam process exited (code {exit_code}) — watching /proc for game…")
+
+    def _poll_game_process(self):
+        """Poll /proc every 2s for the launched game process."""
+        game_name_lower = self._launched_name.lower()
+        try:
+            pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return
+
+        if self._watch_phase == "waiting":
+            # Look for a process matching the game name
+            for pid in pids:
+                try:
+                    comm = open(f"/proc/{pid}/comm").read().strip().lower()
+                    if game_name_lower in comm or comm in game_name_lower:
+                        self._launched_pid = pid
+                        self._watch_phase = "running"
+                        self._watch_status_label.setText(f"Game running (PID {pid})")
+                        self._append_log(f"[Launcher] Game process found: PID {pid} ({comm})")
+                        # Slow down poll interval once running
+                        if self._watch_timer:
+                            self._watch_timer.setInterval(5000)
+                        return
+                except OSError:
+                    continue
+
+        elif self._watch_phase == "running":
+            # Check if the game process is still alive
+            if self._launched_pid and self._launched_pid not in pids:
+                # Process exited
+                self._append_log(f"[Launcher] Game process (PID {self._launched_pid}) exited.")
+                if self._auto_restore_cb.isChecked():
+                    self._stop_watch(restore=True)
+                else:
+                    self._stop_watch(restore=False)
+
+    def _stop_watch(self, restore: bool):
+        if self._watch_timer:
+            self._watch_timer.stop()
+            self._watch_timer = None
+        self._watch_phase = "idle"
+        self._launched_pid = None
+        self._kill_game_btn.setEnabled(False)
+        self._watch_status_label.setText("")
+        if restore and self._parked:
+            self._append_log("[Launcher] Auto-restoring: disabling Gaming Mode…")
+            self._disable_gaming_mode()
+
+    def _kill_launched(self):
+        if self._launched_pid:
+            try:
+                import signal
+                os.kill(self._launched_pid, signal.SIGTERM)
+                self._append_log(f"[Launcher] Sent SIGTERM to PID {self._launched_pid}")
+            except OSError as e:
+                self._append_log(f"[Launcher] Kill failed: {e}")
+        self._stop_watch(restore=self._auto_restore_cb.isChecked())
+
+    @pyqtSlot(str)
     def _append_log(self, msg: str):
         self._log.append(msg)
         self.log_message.emit(msg)

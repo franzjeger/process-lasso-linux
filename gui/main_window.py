@@ -8,11 +8,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QWidget, QVBoxLayout,
+    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QSystemTrayIcon, QMenu, QApplication,
+    QLineEdit, QLabel, QPushButton, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtGui import QIcon, QAction, QCloseEvent
+from PyQt6.QtGui import QIcon, QAction, QCloseEvent, QKeySequence, QShortcut
 
 import config as cfg_module
 from rules import RuleEngine
@@ -23,7 +24,7 @@ from gui.rules_panel import RulesPanel
 from gui.probalance_tab import ProBalanceTab
 from gui.settings_tab import SettingsTab
 from gui.gaming_mode_tab import GamingModeTab
-from gui.cpu_bars import CpuBarsWidget
+from gui.cpu_bars import CpuBarsWidget, CpuHistoryWidget
 
 
 class MainWindow(QMainWindow):
@@ -48,18 +49,19 @@ class MainWindow(QMainWindow):
             w, h = 1100, 820
         self.resize(w, h)
 
-        # WA_TranslucentBackground is intentionally NOT set: toggling it on a
-        # live window is unreliable on X11 and causes content to vanish when
-        # switching to the system theme (window becomes fully transparent).
-
-        # Penguin / Tux icon
-        _tux = "/usr/share/icons/hicolor/scalable/apps/archlinux-kernel-manager-tux.svg"
-        if os.path.exists(_tux):
-            self.setWindowIcon(QIcon(_tux))
+        # App icon
+        _icon_path = "/usr/share/icons/hicolor/scalable/apps/process-lasso-linux.svg"
+        if os.path.exists(_icon_path):
+            _app_icon = QIcon.fromTheme("utilities-system-monitor")
+            self.setWindowIcon(QIcon(_icon_path))
 
         self._build_ui()
         self._build_tray()
         self._start_monitor()
+
+        # Apply opacity from config
+        opacity = self._config.get("ui", {}).get("opacity", 100.0)
+        self.setWindowOpacity(opacity / 100.0)
 
         if self._config.get("ui", {}).get("start_minimized", False):
             self.hide()
@@ -75,14 +77,27 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs)
 
-        # Tab 1: Processes (CPU bars + process table stacked)
+        # Tab 1: Processes (history + bars + filter + process table)
         proc_container = QWidget()
         proc_layout = QVBoxLayout(proc_container)
         proc_layout.setContentsMargins(0, 0, 0, 0)
         proc_layout.setSpacing(4)
 
+        self._cpu_history = CpuHistoryWidget()
+        proc_layout.addWidget(self._cpu_history)
+
         self._cpu_bars = CpuBarsWidget()
         proc_layout.addWidget(self._cpu_bars)
+
+        # Filter row
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self._proc_filter = QLineEdit()
+        self._proc_filter.setPlaceholderText("Process name or PID…")
+        self._proc_filter.setClearButtonEnabled(True)
+        filter_row.addWidget(self._proc_filter)
+        filter_row.addStretch()
+        proc_layout.addLayout(filter_row)
 
         self._proc_table = ProcessTable(
             rule_engine=self._rule_engine,
@@ -90,7 +105,16 @@ class MainWindow(QMainWindow):
         )
         self._proc_table.rule_add_requested.connect(self._on_rule_add_from_table)
         self._proc_table.affinity_manually_changed.connect(self._on_affinity_manual_change)
+        self._proc_filter.textChanged.connect(self._proc_table.set_filter)
         proc_layout.addWidget(self._proc_table)
+
+        # Ctrl+F shortcut to focus filter
+        _shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        _shortcut.activated.connect(lambda: (
+            self._tabs.setCurrentIndex(0),
+            self._proc_filter.setFocus(),
+            self._proc_filter.selectAll(),
+        ))
 
         self._tabs.addTab(proc_container, "Processes")
 
@@ -105,10 +129,11 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._pb_tab, "ProBalance")
 
         # Tab 4: Gaming Mode
-        self._gaming_tab = GamingModeTab()
+        self._gaming_tab = GamingModeTab(self._config)
         self._gaming_tab.reset_requested.connect(self._on_reset_requested)
         self._gaming_tab.log_message.connect(self._append_log)
         self._gaming_tab.gaming_mode_changed.connect(self._on_gaming_mode_changed)
+        self._gaming_tab.config_changed.connect(self._on_gaming_config_changed)
         self._tabs.addTab(self._gaming_tab, "Gaming Mode")
 
         # Tab 5: Settings
@@ -119,6 +144,18 @@ class MainWindow(QMainWindow):
         # Tab 6: Log
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
+
+        # Log toolbar
+        log_toolbar = QHBoxLayout()
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self._log_edit.clear())
+        log_toolbar.addWidget(clear_btn)
+        self._log_autoscroll_cb = QCheckBox("Auto-scroll")
+        self._log_autoscroll_cb.setChecked(True)
+        log_toolbar.addWidget(self._log_autoscroll_cb)
+        log_toolbar.addStretch()
+        log_layout.addLayout(log_toolbar)
+
         self._log_edit = QTextEdit()
         self._log_edit.setReadOnly(True)
         self._log_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
@@ -127,20 +164,21 @@ class MainWindow(QMainWindow):
 
     def _build_tray(self):
         self._tray = QSystemTrayIcon(self)
-        icon = QIcon.fromTheme("utilities-system-monitor")
-        if icon.isNull():
-            icon = QIcon.fromTheme("applications-system")
-        if icon.isNull():
-            icon = self._app.windowIcon()
-        self._tray.setIcon(icon)
+        self._tray.setIcon(self._app.windowIcon())
         self._tray.setToolTip("Process Lasso")
 
         menu = QMenu()
         show_action = QAction("Show / Hide", self)
         show_action.triggered.connect(self._toggle_window)
+
+        self._tray_gaming_action = QAction("▶  Enable Gaming Mode", self)
+        self._tray_gaming_action.triggered.connect(self._gaming_tab._toggle_gaming_mode)
+        self._gaming_tab.gaming_mode_changed.connect(self._update_tray_gaming_action)
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(show_action)
+        menu.addAction(self._tray_gaming_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
@@ -157,6 +195,8 @@ class MainWindow(QMainWindow):
         )
         self._monitor.process_snapshot_ready.connect(self._on_snapshot)
         self._monitor.cpu_snapshot_ready.connect(self._cpu_bars.update_cpu)
+        self._monitor.cpu_snapshot_ready.connect(self._cpu_history.update_cpu)
+        self._monitor.cpu_snapshot_ready.connect(self._on_cpu_for_tray)
         self._monitor.log_message.connect(self._append_log)
         self._monitor.start()
 
@@ -171,6 +211,14 @@ class MainWindow(QMainWindow):
         throttled = self._probalance.get_throttled_pids()
         self._proc_table.update_throttled(throttled)
         self._proc_table.update_snapshot(snapshot)
+        count = len(snapshot)
+        self._tabs.setTabText(0, f"Processes ({count})")
+        pb_idx = self._tabs.indexOf(self._pb_tab)
+        throttled_count = len(throttled)
+        if throttled_count:
+            self._tabs.setTabText(pb_idx, f"ProBalance ({throttled_count})")
+        else:
+            self._tabs.setTabText(pb_idx, "ProBalance")
 
     @pyqtSlot(str)
     def _append_log(self, msg: str):
@@ -183,6 +231,26 @@ class MainWindow(QMainWindow):
             cursor.select(cursor.SelectionType.BlockUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
+        if self._log_autoscroll_cb.isChecked():
+            sb = self._log_edit.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    @pyqtSlot(bool, bool)
+    def _update_tray_gaming_action(self, active: bool, _):
+        if active:
+            self._tray_gaming_action.setText("⏹  Disable Gaming Mode")
+        else:
+            self._tray_gaming_action.setText("▶  Enable Gaming Mode")
+
+    @pyqtSlot(list)
+    def _on_cpu_for_tray(self, percpu: list):
+        avg = sum(percpu) / len(percpu) if percpu else 0.0
+        self._tray.setToolTip(f"Process Lasso — CPU avg {avg:.0f}%")
+
+    @pyqtSlot(dict)
+    def _on_gaming_config_changed(self, cfg: dict):
+        self._config = cfg
+        self._save_config()
 
     def _on_rules_changed(self):
         self._save_config()
@@ -193,9 +261,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def _on_affinity_manual_change(self, pid: int):
-        self._monitor.set_manual_affinity_override(pid, duration_s=30.0)
+        self._monitor.set_manual_affinity_override(pid, 30.0)
 
-    @pyqtSlot(object)
     def _on_rule_add_from_table(self, rule):
         self._rules_panel.add_rule_direct(rule)
         self._tabs.setCurrentIndex(1)  # Switch to Rules tab

@@ -36,10 +36,10 @@ class AffinityDialog(QDialog):
 
         # Gather topology info for CCD-aware display
         try:
-            import cpu_park as _cp
-            offline = _cp.get_offline_cpus()
-            topo = _cp.detect_topology()
-            smt_siblings = _cp.get_smt_siblings_of(set(range(self._cpu_count)))
+            import cpu_park
+            offline = cpu_park.get_offline_cpus()
+            topo = cpu_park.detect_topology()
+            smt_siblings = cpu_park.get_smt_siblings_of(set(range(self._cpu_count)))
         except Exception:
             offline = set()
             topo = None
@@ -572,3 +572,203 @@ class RuleEditDialog(QDialog):
         if rule_id:
             r.rule_id = rule_id
         return r
+
+
+class SteamGamePickerDialog(QDialog):
+    """Browse the local Steam library and pick a game to launch."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pick Steam Game")
+        self.setMinimumSize(560, 480)
+        self._appid: str = ""
+        self._name: str = ""
+        self._all_rows: list[tuple[str, str]] = []   # (appid, name)
+        self._build_ui()
+        QTimer.singleShot(0, self._scan_library)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Filter:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Type to filter games…")
+        self._search.textChanged.connect(self._filter)
+        search_row.addWidget(self._search)
+        layout.addLayout(search_row)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["AppID", "Game Name"])
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.doubleClicked.connect(self._on_accept)
+        layout.addWidget(self._table)
+
+        self._status = QLabel("Scanning Steam library…")
+        self._status.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(self._status)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _scan_library(self):
+        from pathlib import Path
+        import re
+
+        games: dict[str, str] = {}
+
+        # Candidate Steam root paths (resolve symlinks to avoid duplicates)
+        steam_roots_raw = [
+            Path.home() / ".steam" / "steam",
+            Path.home() / ".local" / "share" / "Steam",
+        ]
+        seen = set()
+        library_dirs: list[Path] = []
+        for root in steam_roots_raw:
+            try:
+                resolved = root.resolve()
+            except Exception:
+                continue
+            if resolved not in seen and resolved.exists():
+                seen.add(resolved)
+                library_dirs.append(resolved / "steamapps")
+
+        # Parse libraryfolders.vdf for additional library paths
+        for lib_dir in list(library_dirs):
+            vdf = lib_dir / "libraryfolders.vdf"
+            if not vdf.exists():
+                continue
+            try:
+                text = vdf.read_text(errors="replace")
+                for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+                    p = Path(m.group(1)).resolve()
+                    apps = p / "steamapps"
+                    if apps not in seen and apps.exists():
+                        seen.add(apps)
+                        library_dirs.append(apps)
+            except Exception:
+                pass
+
+        # Read appmanifest files
+        for apps_dir in library_dirs:
+            try:
+                for fname in apps_dir.iterdir():
+                    if not fname.name.startswith("appmanifest_") or not fname.name.endswith(".acf"):
+                        continue
+                    try:
+                        text = fname.read_text(errors="replace")
+                        m_id   = re.search(r'"appid"\s+"(\d+)"', text)
+                        m_name = re.search(r'"name"\s+"([^"]+)"', text)
+                        if m_id and m_name:
+                            games[m_id.group(1)] = m_name.group(1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        rows = sorted(games.items(), key=lambda x: x[1].lower())
+        self._all_rows = rows
+        self._render_rows(rows)
+        self._status.setText(f"{len(rows)} games found")
+
+    def _render_rows(self, rows: list[tuple[str, str]]):
+        self._table.setRowCount(len(rows))
+        for r, (appid, name) in enumerate(rows):
+            self._table.setItem(r, 0, QTableWidgetItem(appid))
+            self._table.setItem(r, 1, QTableWidgetItem(name))
+
+    def _filter(self, text: str):
+        text = text.lower()
+        filtered = [(a, n) for a, n in self._all_rows if text in n.lower() or text in a]
+        self._render_rows(filtered)
+
+    def _on_accept(self):
+        row = self._table.currentRow()
+        if row < 0:
+            return
+        self._appid = self._table.item(row, 0).text() if self._table.item(row, 0) else ""
+        self._name  = self._table.item(row, 1).text() if self._table.item(row, 1) else ""
+        self.accept()
+
+    def get_selection(self) -> tuple[str, str]:
+        """Return (appid, name) of the selected game."""
+        return self._appid, self._name
+
+
+# ── Rule presets ───────────────────────────────────────────────────────────────
+
+_RULE_PRESETS = [
+    # name, pattern, match_type, affinity, nice, ionice_class, ionice_level
+    ("Steam (CCD0)",        "steam",           "exact",    "0-7,16-23",  None, None, None),
+    ("steamwebhelper",      "steamwebhelper",  "exact",    "0-7,16-23",  5,    None, None),
+    ("Wine / Proton",       "wine",            "contains", "0-7,16-23",  None, None, None),
+    ("Proton (exact)",      "proton",          "contains", "0-7,16-23",  None, None, None),
+    ("OBS Studio",          "obs",             "exact",    "0-7,16-23",  -1,   None, None),
+    ("Discord",             "discord",         "contains", "8-15,24-31", 5,    None, None),
+    ("Firefox",             "firefox",         "contains", "8-15,24-31", None, None, None),
+    ("Chromium / Chrome",   "chrom",           "contains", "8-15,24-31", None, None, None),
+    ("Brave",               "brave",           "contains", "8-15,24-31", None, None, None),
+    ("KWin",                "kwin",            "contains", None,         None, None, None),
+    ("Plasma Shell",        "plasmashell",     "exact",    "8-15,24-31", 5,    None, None),
+    ("Compiler (gcc/clang)","gcc",             "contains", "0-15,16-31", None, 2,    4),
+    ("Archive / compress",  "7z",              "contains", "8-15,24-31", 10,   3,    None),
+    ("Background (nice 10)","",                "contains", None,         10,   None, None),
+]
+
+
+class RulePresetsDialog(QDialog):
+    """Choose a preset rule template to add."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rule Templates")
+        self.setMinimumSize(680, 400)
+        self._selected_preset = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select a preset to create a pre-filled rule:"))
+
+        self._table = QTableWidget(len(_RULE_PRESETS), 6)
+        self._table.setHorizontalHeaderLabels(["Name", "Pattern", "Match", "Affinity", "Nice", "I/O"])
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.doubleClicked.connect(self.accept)
+
+        for r, (name, pat, match, aff, nice, ioc, iol) in enumerate(_RULE_PRESETS):
+            self._table.setItem(r, 0, QTableWidgetItem(name))
+            self._table.setItem(r, 1, QTableWidgetItem(pat))
+            self._table.setItem(r, 2, QTableWidgetItem(match))
+            self._table.setItem(r, 3, QTableWidgetItem(aff or ""))
+            self._table.setItem(r, 4, QTableWidgetItem(str(nice) if nice is not None else ""))
+            self._table.setItem(r, 5, QTableWidgetItem(f"{ioc}" if ioc is not None else ""))
+
+        layout.addWidget(self._table)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_preset(self):
+        """Return the selected preset tuple or None."""
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        return _RULE_PRESETS[row]

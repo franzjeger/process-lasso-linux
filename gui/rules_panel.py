@@ -8,9 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTableWidget, QTableWidgetItem, QAbstractItemView,
-    QHeaderView, QMessageBox,
+    QHeaderView, QMessageBox, QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+import json
 
 from rules import RuleEngine, Rule
 from gui.dialogs import RuleEditDialog
@@ -42,15 +43,21 @@ class RulesPanel(QWidget):
         layout.addWidget(self._table)
 
         btn_row = QHBoxLayout()
-        add_btn = QPushButton("Add Rule")
-        edit_btn = QPushButton("Edit")
-        del_btn = QPushButton("Delete")
-        toggle_btn = QPushButton("Enable/Disable")
+        add_btn      = QPushButton("Add Rule")
+        templates_btn = QPushButton("Templates…")
+        edit_btn     = QPushButton("Edit")
+        del_btn      = QPushButton("Delete")
+        toggle_btn   = QPushButton("Enable/Disable")
+        export_btn   = QPushButton("Export…")
+        import_btn   = QPushButton("Import…")
         add_btn.clicked.connect(self._add_rule)
+        templates_btn.clicked.connect(self._show_presets)
         edit_btn.clicked.connect(self._edit_selected)
         del_btn.clicked.connect(self._delete_selected)
         toggle_btn.clicked.connect(self._toggle_selected)
-        for b in [add_btn, edit_btn, del_btn, toggle_btn]:
+        export_btn.clicked.connect(self._export_rules)
+        import_btn.clicked.connect(self._import_rules)
+        for b in [add_btn, templates_btn, edit_btn, del_btn, toggle_btn, export_btn, import_btn]:
             btn_row.addWidget(b)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -137,3 +144,61 @@ class RulesPanel(QWidget):
         self._engine.update_rule(rule)
         self.refresh()
         self.rules_changed.emit()
+
+    def _show_presets(self):
+        from gui.dialogs import RulePresetsDialog, RuleEditDialog
+        pdlg = RulePresetsDialog(self)
+        if pdlg.exec() != RulePresetsDialog.DialogCode.Accepted:
+            return
+        preset = pdlg.get_preset()
+        if not preset:
+            return
+        name, pat, match, aff, nice, ioc, iol = preset
+        template = Rule(
+            name=name, pattern=pat, match_type=match,
+            affinity=aff, nice=nice,
+            ionice_class=ioc, ionice_level=iol,
+        )
+        dlg = RuleEditDialog(rule=template, parent=self)
+        if dlg.exec() == RuleEditDialog.DialogCode.Accepted:
+            rule = dlg.get_rule()
+            self._engine.add_rule(rule)
+            self.refresh()
+            self.rules_changed.emit()
+
+    def _export_rules(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Rules", "process_lasso_rules.json", "JSON files (*.json)"
+        )
+        if not path:
+            return
+        rules_data = [r.to_dict() for r in self._engine.get_rules()]
+        try:
+            with open(path, "w") as f:
+                json.dump(rules_data, f, indent=2)
+            QMessageBox.information(self, "Export", f"Exported {len(rules_data)} rules to {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Failed", str(e))
+
+    def _import_rules(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Rules", "", "JSON files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            imported = 0
+            for d in data:
+                try:
+                    rule = Rule.from_dict(d)
+                    self._engine.add_rule(rule)
+                    imported += 1
+                except Exception:
+                    pass
+            self.refresh()
+            self.rules_changed.emit()
+            QMessageBox.information(self, "Import", f"Imported {imported} rules from {path}")
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Import Failed", str(e))

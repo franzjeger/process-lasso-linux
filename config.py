@@ -37,6 +37,10 @@ DEFAULT_CONFIG = {
         "start_minimized": False,
         "sort_column": "cpu_percent",
         "sort_order": "desc",
+        "opacity": 100,
+    },
+    "gaming_mode": {
+        "profiles": {},
     },
 }
 

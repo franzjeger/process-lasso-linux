@@ -67,6 +67,11 @@ def _safe_proc_info(proc: psutil.Process) -> dict | None:
                 ionice_str = f"{ionice.ioclass}/{ionice.value}"
             except (psutil.AccessDenied, AttributeError):
                 ionice_str = ""
+            try:
+                cmdline_parts = proc.cmdline()
+                cmdline_str = " ".join(cmdline_parts) if cmdline_parts else ""
+            except (psutil.AccessDenied, AttributeError):
+                cmdline_str = ""
             return {
                 "pid": pid,
                 "name": name,
@@ -75,6 +80,7 @@ def _safe_proc_info(proc: psutil.Process) -> dict | None:
                 "nice": nice,
                 "affinity": affinity_str,
                 "ionice": ionice_str,
+                "cmdline": cmdline_str,
             }
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return None
