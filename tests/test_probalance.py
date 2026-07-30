@@ -17,8 +17,33 @@ CFG = {
 }
 
 
-def proc(pid=100, name="hog", cpu=95.0, nice=0):
-    return {"pid": pid, "name": name, "cpu_percent": cpu, "nice": nice}
+def proc(pid=100, name="hog", cpu=95.0, nice=0, create_time=1000.0):
+    return {"pid": pid, "name": name, "cpu_percent": cpu, "nice": nice,
+            "create_time": create_time}
+
+
+class FakeLimiter:
+    def __init__(self, is_available=True, limit_ok=True):
+        self.is_available = is_available
+        self.limit_ok = limit_ok
+        self.limits = []       # (pid, percent)
+        self.unlimited = []    # pid
+        self.cleaned = []      # pid
+
+    def available(self):
+        return self.is_available
+
+    def limit(self, pid, percent):
+        if self.limit_ok:
+            self.limits.append((pid, percent))
+        return self.limit_ok
+
+    def unlimit(self, pid):
+        self.unlimited.append(pid)
+        return True
+
+    def cleanup(self, pid):
+        self.cleaned.append(pid)
 
 
 @pytest.fixture
@@ -190,3 +215,88 @@ class TestLifecycle:
         pb.tick([proc(cpu=95)], 3.0)
         assert len(logged) == 1
         assert "THROTTLE" in logged[0]
+
+    def test_recycled_pid_does_not_inherit_state(self, nice_calls):
+        # Same PID, new create_time → brand-new process: no instant throttle,
+        # and the new process's own nice becomes the recorded original.
+        pb = make_pb()
+        pb.tick([proc(cpu=95, create_time=1000.0)], 2.0)   # almost throttled
+        pb.tick([proc(cpu=95, create_time=2000.0)], 1.0)   # recycled PID
+        assert pb.get_throttled_pids() == set()            # counter restarted
+
+    def test_recycled_pid_of_throttled_process(self, nice_calls):
+        pb = make_pb()
+        pb.tick([proc(cpu=95, nice=5, create_time=1000.0)], 3.0)
+        assert pb.get_throttled_pids() == {100}
+        # PID recycled: old state dropped, new proc tracked from scratch
+        pb.tick([proc(cpu=10, nice=0, create_time=2000.0)], 10.0)
+        assert pb.get_throttled_pids() == set()
+        # No restore was issued for the recycled pid (only the throttle call)
+        assert nice_calls.calls == [(100, 15)]
+
+
+class TestCgroupMode:
+    def _cfg(self):
+        return dict(CFG, throttle_mode="cgroup", cgroup_limit_percent=50)
+
+    def test_cgroup_throttle_and_restore(self, nice_calls):
+        limiter = FakeLimiter()
+        pb = ProBalance(self._cfg(), limiter=limiter)
+        pb.tick([proc(cpu=95)], 3.0)
+        assert limiter.limits == [(100, 50)]
+        assert pb.get_throttled_pids() == {100}
+        assert nice_calls.calls == []          # nice untouched in cgroup mode
+
+        pb.tick([proc(cpu=10)], 5.0)
+        assert limiter.unlimited == [100]
+        assert pb.get_throttled_pids() == set()
+        assert nice_calls.calls == []
+
+    def test_falls_back_to_nice_when_unavailable(self, nice_calls):
+        limiter = FakeLimiter(is_available=False)
+        pb = ProBalance(self._cfg(), limiter=limiter)
+        pb.tick([proc(cpu=95)], 3.0)
+        assert limiter.limits == []
+        assert nice_calls.calls == [(100, 10)]
+        assert pb.get_throttled_pids() == {100}
+        # Restore uses the method the throttle was applied with
+        pb.tick([proc(cpu=10, nice=10)], 5.0)
+        assert nice_calls.calls == [(100, 10), (100, 0)]
+        assert limiter.unlimited == []
+
+    def test_failed_limit_keeps_state_normal(self, nice_calls):
+        limiter = FakeLimiter(limit_ok=False)
+        pb = ProBalance(self._cfg(), limiter=limiter)
+        pb.tick([proc(cpu=95)], 3.0)
+        assert pb.get_throttled_pids() == set()
+
+    def test_dead_cgroup_throttled_pid_cleaned_up(self, nice_calls):
+        limiter = FakeLimiter()
+        pb = ProBalance(self._cfg(), limiter=limiter)
+        pb.tick([proc(cpu=95)], 3.0)
+        pb.tick([proc(pid=200, cpu=5)], 1.0)   # pid 100 gone
+        assert limiter.cleaned == [100]
+
+
+class TestShutdown:
+    def test_shutdown_reverts_nice_throttles(self, nice_calls):
+        pb = make_pb()
+        pb.tick([proc(cpu=95, nice=3)], 3.0)
+        nice_calls.calls.clear()
+        pb.shutdown()
+        assert nice_calls.calls == [(100, 3)]
+        assert pb.get_throttled_pids() == set()
+
+    def test_shutdown_reverts_cgroup_throttles(self, nice_calls):
+        limiter = FakeLimiter()
+        pb = ProBalance(dict(CFG, throttle_mode="cgroup"), limiter=limiter)
+        pb.tick([proc(cpu=95)], 3.0)
+        pb.shutdown()
+        assert limiter.unlimited == [100]
+
+    def test_shutdown_ignores_normal_processes(self, nice_calls):
+        pb = make_pb()
+        pb.tick([proc(cpu=10)], 3.0)
+        nice_calls.calls.clear()
+        pb.shutdown()
+        assert nice_calls.calls == []

@@ -105,6 +105,44 @@ class TestGetOnlineCpus:
         assert utils.get_online_cpus() == {0, 1, 2, 3}
 
 
+class TestProcNameMatches:
+    @pytest.fixture
+    def fake_proc(self, tmp_path):
+        def make(pid, comm, cmdline=""):
+            d = tmp_path / str(pid)
+            d.mkdir()
+            (d / "comm").write_text(comm + "\n")
+            (d / "cmdline").write_text(cmdline.replace(" ", "\x00"))
+        make.root = str(tmp_path)
+        return make
+
+    def test_normalized_comm_match(self, fake_proc):
+        fake_proc(100, "PathOfExile")
+        assert utils.proc_name_matches("Path of Exile", 100, fake_proc.root)
+
+    def test_truncated_comm_matches_substring(self, fake_proc):
+        # kernel-truncated comm is a prefix of the normalized game name
+        fake_proc(100, "PathOfExileStea")
+        assert utils.proc_name_matches("Path of Exile Steam", 100, fake_proc.root)
+
+    def test_cmdline_fallback_for_wine_wrapper(self, fake_proc):
+        fake_proc(100, "wine64-preloader",
+                  "Z:\\games\\TotalWarAttila\\attila.exe -windowed")
+        assert utils.proc_name_matches("attila", 100, fake_proc.root)
+
+    def test_no_match(self, fake_proc):
+        fake_proc(100, "firefox", "/usr/bin/firefox")
+        assert not utils.proc_name_matches("Path of Exile", 100, fake_proc.root)
+
+    def test_dead_pid(self, fake_proc):
+        assert not utils.proc_name_matches("game", 999, fake_proc.root)
+
+    def test_empty_name_never_matches(self, fake_proc):
+        fake_proc(100, "anything")
+        assert not utils.proc_name_matches("", 100, fake_proc.root)
+        assert not utils.proc_name_matches("---", 100, fake_proc.root)
+
+
 class TestSetAffinity:
     def test_bad_cpulist_returns_false(self):
         assert utils.set_affinity(12345, "not-a-list") is False

@@ -14,6 +14,7 @@ from PyQt6.QtCore import pyqtSignal, QThread, QObject, pyqtSlot, Qt, QTimer, QPr
 from PyQt6.QtGui import QFont
 
 import cpu_park
+import utils
 
 
 class _WorkerSignals(QObject):
@@ -61,8 +62,16 @@ class GamingModeTab(QWidget):
         self._watch_phase: str = "idle"   # idle | waiting | running
         self._watch_timer: QTimer | None = None
         self._pending_enable_after_unpark: bool = False
+        self._auto_active_profile: str = ""   # profile that auto-enabled gaming mode
         self._build_ui()
         self._detect_topology()
+
+        # Auto-activation: poll for processes matching profiles marked
+        # auto_activate, even when the game wasn't launched from here.
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(5000)
+        self._auto_timer.timeout.connect(self._auto_detect_poll)
+        self._auto_timer.start()
 
     def _build_ui(self):
         # Wrap everything in a scroll area so the tab doesn't force window height
@@ -254,6 +263,15 @@ class GamingModeTab(QWidget):
         self._launch_btn.setFont(font2)
         self._launch_btn.clicked.connect(self._launch_with_gaming_mode)
         launch_row.addWidget(self._launch_btn)
+
+        self._auto_activate_cb = QCheckBox("Auto-enable Gaming Mode when this game is detected")
+        self._auto_activate_cb.setToolTip(
+            "Saved with the profile. When checked, Gaming Mode activates with\n"
+            "this profile's settings whenever the game process appears — even\n"
+            "if it was launched from Steam/Lutris directly instead of from here.\n"
+            "Gaming Mode is disabled again when the game exits."
+        )
+        launch_row.addWidget(self._auto_activate_cb)
 
         self._auto_restore_cb = QCheckBox("Auto-disable Gaming Mode when game exits")
         self._auto_restore_cb.setChecked(True)
@@ -519,6 +537,7 @@ class GamingModeTab(QWidget):
             "command":      self._cmd_edit.text().strip(),
             "cpu_states":   {str(cpu): cb.isChecked() for cpu, cb in self._preferred_cbs.items()},
             "elevate_nice": self._nice_cb.isChecked(),
+            "auto_activate": self._auto_activate_cb.isChecked(),
         }
         self._config.setdefault("gaming_mode", {}).setdefault("profiles", {})[name] = profile
         self.config_changed.emit(self._config)
@@ -541,6 +560,7 @@ class GamingModeTab(QWidget):
         # Restore nice preference
         if "elevate_nice" in profile:
             self._nice_cb.setChecked(profile["elevate_nice"])
+        self._auto_activate_cb.setChecked(profile.get("auto_activate", False))
 
         # Restore CPU checkbox states (keys stored as strings)
         cpu_states = profile.get("cpu_states", {})
@@ -635,32 +655,7 @@ class GamingModeTab(QWidget):
 
     @staticmethod
     def _proc_name_matches(game_name: str, pid: int) -> bool:
-        """Return True if the process at *pid* looks like it matches *game_name*.
-
-        Normalises both sides by lowercasing and stripping all non-alphanumeric
-        characters so that "Path of Exile" matches comm "PathOfExile" (or the
-        15-char truncated variant).  Falls back to checking /proc/pid/cmdline.
-        """
-        import re
-        def norm(s: str) -> str:
-            return re.sub(r'[^a-z0-9]', '', s.lower())
-
-        name_n = norm(game_name)
-        try:
-            comm = open(f"/proc/{pid}/comm").read().strip()
-            comm_n = norm(comm)
-            if name_n in comm_n or comm_n in name_n:
-                return True
-        except OSError:
-            return False
-        # Secondary check: cmdline (handles Proton/Wine wrappers that forward the game exe)
-        try:
-            cmdline = open(f"/proc/{pid}/cmdline").read().replace('\x00', ' ')
-            if name_n in norm(cmdline):
-                return True
-        except OSError:
-            pass
-        return False
+        return utils.proc_name_matches(game_name, pid)
 
     def _poll_game_process(self):
         """Poll /proc every 2s for the launched game process."""
@@ -716,11 +711,72 @@ class GamingModeTab(QWidget):
             self._watch_timer = None
         self._watch_phase = "idle"
         self._launched_pid = None
+        self._auto_active_profile = ""
         self._kill_game_btn.setEnabled(False)
         self._watch_status_label.setText("")
         if restore and self._parked:
             self._append_log("[Launcher] Auto-restoring: disabling Gaming Mode…")
             self._disable_gaming_mode()
+
+    # ── Auto-activation (profiles with auto_activate) ─────────────────────
+
+    def _auto_detect_poll(self):
+        """Every 5s: if an auto_activate profile's game is running and Gaming
+        Mode is off, load that profile and enable Gaming Mode. The regular
+        watch machinery then disables it again when the game exits."""
+        if self._watch_phase != "idle":
+            return  # launcher/watcher already managing a game
+        if self._parked:
+            return  # gaming mode already on (manual or auto) — nothing to do
+        if not self._topo or not self._topo.has_asymmetry:
+            return
+        if not cpu_park.is_helper_installed():
+            return
+
+        profiles = self._config.get("gaming_mode", {}).get("profiles", {})
+        auto_profiles = {
+            name: p for name, p in profiles.items()
+            if p.get("auto_activate") and p.get("game_name")
+        }
+        if not auto_profiles:
+            return
+
+        try:
+            pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return
+
+        for name, profile in sorted(auto_profiles.items()):
+            game_name = profile["game_name"]
+            pid = next(
+                (p for p in pids if utils.proc_name_matches(game_name, p)), None
+            )
+            if pid is None:
+                continue
+            self._append_log(
+                f"[Auto] Detected '{game_name}' (PID {pid}) — "
+                f"activating Gaming Mode with profile '{name}'."
+            )
+            self._auto_active_profile = name
+            # Load the profile's settings (fills CPU checkboxes, nice pref)
+            idx = self._profile_combo.findText(name)
+            if idx >= 0:
+                self._profile_combo.setCurrentIndex(idx)  # triggers _load_profile
+            # Watch the game so Gaming Mode turns off again when it exits
+            self._launched_name = game_name
+            self._launched_pid = pid
+            self._watch_phase = "running"
+            self._auto_restore_cb.setChecked(True)
+            self._watch_status_label.setText(f"Game running (PID {pid}) — auto")
+            self._kill_game_btn.setEnabled(True)
+            if self._watch_timer:
+                self._watch_timer.stop()
+            self._watch_timer = QTimer(self)
+            self._watch_timer.setInterval(5000)
+            self._watch_timer.timeout.connect(self._poll_game_process)
+            self._watch_timer.start()
+            self._enable_gaming_mode()
+            return
 
     def _kill_launched(self):
         if self._launched_pid:

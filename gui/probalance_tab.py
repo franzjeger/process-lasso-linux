@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QGroupBox,
     QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
     QListWidget, QHBoxLayout, QLineEdit, QLabel, QMessageBox,
+    QComboBox,
 )
 from PyQt6.QtCore import pyqtSignal
 
@@ -31,6 +32,29 @@ class ProBalanceTab(QWidget):
         # Throttle group
         throttle_group = QGroupBox("Throttle Settings")
         form = QFormLayout(throttle_group)
+
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Lower priority (nice)", "nice")
+        self._mode_combo.addItem("Hard CPU cap (cgroup)", "cgroup")
+        self._mode_combo.setToolTip(
+            "nice: lowers scheduling priority — the hog still uses idle CPU.\n"
+            "cgroup: hard-caps CPU time via a cgroup v2 cpu.max quota — the\n"
+            "hog is actually limited. Needs a systemd user session (delegated\n"
+            "cgroup subtree); falls back to nice when unavailable."
+        )
+        idx = self._mode_combo.findData(cfg.get("throttle_mode", "nice"))
+        if idx >= 0:
+            self._mode_combo.setCurrentIndex(idx)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Throttle method:", self._mode_combo)
+
+        self._cgroup_pct = QSpinBox()
+        self._cgroup_pct.setRange(5, 6400)
+        self._cgroup_pct.setSingleStep(25)
+        self._cgroup_pct.setSuffix(" % of one core")
+        self._cgroup_pct.setToolTip("100 = one full core, 200 = two cores, …")
+        self._cgroup_pct.setValue(cfg.get("cgroup_limit_percent", 100))
+        form.addRow("CPU cap (cgroup mode):", self._cgroup_pct)
 
         self._cpu_thresh = QDoubleSpinBox()
         self._cpu_thresh.setRange(10.0, 100.0)
@@ -56,6 +80,7 @@ class ProBalanceTab(QWidget):
         form.addRow("Nice floor (max nice applied):", self._nice_floor)
 
         layout.addWidget(throttle_group)
+        self._on_mode_changed()
 
         # Restore group
         restore_group = QGroupBox("Restore Settings")
@@ -105,6 +130,12 @@ class ProBalanceTab(QWidget):
         layout.addWidget(apply_btn)
         layout.addStretch()
 
+    def _on_mode_changed(self):
+        is_cgroup = self._mode_combo.currentData() == "cgroup"
+        self._cgroup_pct.setEnabled(is_cgroup)
+        self._nice_adj.setEnabled(not is_cgroup)
+        self._nice_floor.setEnabled(not is_cgroup)
+
     def _add_exempt(self):
         text = self._exempt_edit.text().strip()
         if text:
@@ -127,6 +158,8 @@ class ProBalanceTab(QWidget):
         ]
         return {
             "enabled": self._enabled_cb.isChecked(),
+            "throttle_mode": self._mode_combo.currentData(),
+            "cgroup_limit_percent": self._cgroup_pct.value(),
             "cpu_threshold_percent": self._cpu_thresh.value(),
             "consecutive_seconds": self._consec_secs.value(),
             "nice_adjustment": self._nice_adj.value(),

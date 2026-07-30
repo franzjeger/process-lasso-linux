@@ -21,6 +21,10 @@ DEFAULT_CONFIG = {
     },
     "probalance": {
         "enabled": True,
+        # "nice" lowers priority; "cgroup" hard-caps CPU time via cpu.max
+        # (falls back to nice when no delegated cgroup subtree is available)
+        "throttle_mode": "nice",
+        "cgroup_limit_percent": 100,   # % of one core (200 = two cores, …)
         "cpu_threshold_percent": 85.0,
         "consecutive_seconds": 3,
         "nice_adjustment": 10,

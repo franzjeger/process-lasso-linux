@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import logging
 
 import psutil
@@ -143,6 +144,37 @@ def get_affinity_set(pid: int) -> set[int] | None:
         return set(os.sched_getaffinity(pid))
     except OSError:
         return None
+
+
+def _norm_token(s: str) -> str:
+    """Lowercase and strip non-alphanumerics: 'Path of Exile' → 'pathofexile'."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def proc_name_matches(game_name: str, pid: int, proc_root: str = "/proc") -> bool:
+    """Return True if the process at *pid* looks like it matches *game_name*.
+
+    Normalises both sides (lowercase, alphanumerics only) so that
+    'Path of Exile' matches comm 'PathOfExile' (or its 15-char truncated
+    variant). Falls back to checking cmdline for Proton/Wine wrappers that
+    forward the game exe path."""
+    name_n = _norm_token(game_name)
+    if not name_n:
+        return False
+    try:
+        comm = open(f"{proc_root}/{pid}/comm").read().strip()
+    except OSError:
+        return False
+    comm_n = _norm_token(comm)
+    if comm_n and (name_n in comm_n or comm_n in name_n):
+        return True
+    try:
+        cmdline = open(f"{proc_root}/{pid}/cmdline").read().replace("\x00", " ")
+        if name_n in _norm_token(cmdline):
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def get_online_cpus() -> set[int]:
