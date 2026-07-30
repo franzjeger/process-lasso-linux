@@ -120,6 +120,7 @@ class TestRuleEngine:
 class TestApplyToProcess:
     @pytest.fixture
     def mock_utils(self, monkeypatch):
+        import utils as real_utils
         import rules as rules_mod
         calls = {"affinity": [], "nice": [], "ionice": []}
 
@@ -127,6 +128,30 @@ class TestApplyToProcess:
             set_affinity_ok = True
             set_nice_ok = True
             set_ionice_ok = True
+            # Current-state readbacks for drift checks. Defaults simulate a
+            # process with nothing applied yet, so every rule action fires.
+            current_nice = None
+            current_ionice = None
+            current_affinity = None
+            online_cpus = set(range(32))
+
+            cpulist_to_set = staticmethod(real_utils.cpulist_to_set)
+
+            @staticmethod
+            def get_online_cpus():
+                return FakeUtils.online_cpus
+
+            @staticmethod
+            def get_nice(pid):
+                return FakeUtils.current_nice
+
+            @staticmethod
+            def get_ionice(pid):
+                return FakeUtils.current_ionice
+
+            @staticmethod
+            def get_affinity_set(pid):
+                return FakeUtils.current_affinity
 
             @staticmethod
             def set_affinity(pid, cpulist):
@@ -199,6 +224,65 @@ class TestApplyToProcess:
         engine.add_rule(Rule(name="b", pattern=".exe", nice=10))
         engine.apply_to_process(42, "game.exe")
         assert mock_utils.calls["nice"] == [(42, 5), (42, 10)]
+
+    def test_already_applied_nice_is_skipped(self, mock_utils):
+        mock_utils.current_nice = 5
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", nice=5))
+        assert engine.apply_to_process(42, "game") == []
+        assert mock_utils.calls["nice"] == []
+
+    def test_already_applied_affinity_is_skipped(self, mock_utils):
+        mock_utils.current_affinity = {0, 1, 2, 3}
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", affinity="0-3"))
+        assert engine.apply_to_process(42, "game") == []
+
+    def test_affinity_comparison_ignores_offline_cpus(self, mock_utils):
+        # Rule wants 0-7 but 4-7 are parked: running on 0-3 counts as applied
+        mock_utils.online_cpus = {0, 1, 2, 3}
+        mock_utils.current_affinity = {0, 1, 2, 3}
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", affinity="0-7"))
+        assert engine.apply_to_process(42, "game") == []
+
+    def test_drifted_affinity_is_reapplied(self, mock_utils):
+        mock_utils.current_affinity = {0, 1}
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", affinity="0-3"))
+        engine.apply_to_process(42, "game")
+        assert mock_utils.calls["affinity"] == [(42, "0-3")]
+
+    def test_already_applied_ionice_is_skipped(self, mock_utils):
+        mock_utils.current_ionice = (2, 4)
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", ionice_class=2, ionice_level=4))
+        assert engine.apply_to_process(42, "game") == []
+
+    def test_ionice_level_ignored_for_idle_class(self, mock_utils):
+        # idle class has no level; matching class alone counts as applied
+        mock_utils.current_ionice = (3, 0)
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", ionice_class=3, ionice_level=5))
+        assert engine.apply_to_process(42, "game") == []
+
+    def test_skip_nice_leaves_nice_alone(self, mock_utils):
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", nice=0, affinity="0-3"))
+        engine.apply_to_process(42, "game", skip_nice=True)
+        assert mock_utils.calls["nice"] == []
+        assert mock_utils.calls["affinity"] == [(42, "0-3")]
+
+    def test_has_match(self, mock_utils):
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", nice=5))
+        assert engine.has_match("game.exe") is True
+        assert engine.has_match("firefox") is False
+
+    def test_has_match_ignores_disabled_rules(self, mock_utils):
+        engine = RuleEngine()
+        engine.add_rule(Rule(name="r", pattern="game", nice=5, enabled=False))
+        assert engine.has_match("game") is False
 
     def test_log_callback_receives_actions(self, mock_utils):
         engine = RuleEngine()

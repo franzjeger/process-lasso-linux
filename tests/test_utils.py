@@ -139,70 +139,102 @@ class TestSetAffinity:
 
 
 class TestSetNice:
-    def _run_result(self, returncode, stderr=""):
-        class R:
-            pass
-        r = R()
-        r.returncode = returncode
-        r.stderr = stderr
-        return r
-
     def test_success(self, monkeypatch):
-        cmds = []
-
-        def run(cmd, **kwargs):
-            cmds.append(cmd)
-            return self._run_result(0)
-
-        monkeypatch.setattr(utils.subprocess, "run", run)
+        calls = []
+        monkeypatch.setattr(utils.os, "setpriority",
+                            lambda which, pid, nice: calls.append((which, pid, nice)))
         assert utils.set_nice(42, 10) is True
-        assert cmds[0] == ["renice", "-n", "10", "-p", "42"]
+        assert calls == [(utils.os.PRIO_PROCESS, 42, 10)]
 
-    def test_nonzero_exit_returns_false(self, monkeypatch):
-        monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: self._run_result(1, "permission denied"))
+    def test_permission_error_returns_false(self, monkeypatch):
+        def setpriority(which, pid, nice):
+            raise PermissionError()
+        monkeypatch.setattr(utils.os, "setpriority", setpriority)
         assert utils.set_nice(42, -5) is False
 
-    def test_missing_binary_returns_false(self, monkeypatch):
-        def run(*a, **k):
-            raise FileNotFoundError("renice")
-        monkeypatch.setattr(utils.subprocess, "run", run)
+    def test_dead_process_returns_false(self, monkeypatch):
+        def setpriority(which, pid, nice):
+            raise ProcessLookupError()
+        monkeypatch.setattr(utils.os, "setpriority", setpriority)
         assert utils.set_nice(42, 5) is False
 
 
+class TestGetNice:
+    def test_success(self, monkeypatch):
+        monkeypatch.setattr(utils.os, "getpriority", lambda which, pid: 7)
+        assert utils.get_nice(42) == 7
+
+    def test_gone_returns_none(self, monkeypatch):
+        def getpriority(which, pid):
+            raise ProcessLookupError()
+        monkeypatch.setattr(utils.os, "getpriority", getpriority)
+        assert utils.get_nice(42) is None
+
+
+class _FakeIONice:
+    """Mimics psutil.Process for ionice get/set."""
+    def __init__(self, ioclass=0, value=0, fail=False):
+        self.ioclass = ioclass
+        self.value = value
+        self.fail = fail
+        self.calls = []
+
+    def __call__(self, pid):     # constructor stand-in: psutil.Process(pid)
+        return self
+
+    def ionice(self, *args):
+        if self.fail:
+            raise utils.psutil.Error("denied")
+        if args:
+            self.calls.append(args)
+            return None
+        import collections
+        P = collections.namedtuple("pionice", ["ioclass", "value"])
+        return P(self.ioclass, self.value)
+
+
 class TestSetIonice:
-    def _capture(self, monkeypatch, returncode=0):
-        cmds = []
-
-        class R:
-            pass
-
-        def run(cmd, **kwargs):
-            cmds.append(cmd)
-            r = R()
-            r.returncode = returncode
-            r.stderr = ""
-            return r
-
-        monkeypatch.setattr(utils.subprocess, "run", run)
-        return cmds
-
     def test_best_effort_with_level(self, monkeypatch):
-        cmds = self._capture(monkeypatch)
+        fake = _FakeIONice()
+        monkeypatch.setattr(utils.psutil, "Process", fake)
         assert utils.set_ionice(42, 2, 4) is True
-        assert cmds[0] == ["ionice", "-c", "2", "-n", "4", "-p", "42"]
+        assert fake.calls == [(2, 4)]
 
     def test_idle_class_omits_level(self, monkeypatch):
         # class 3 (idle) takes no level even when one is given
-        cmds = self._capture(monkeypatch)
+        fake = _FakeIONice()
+        monkeypatch.setattr(utils.psutil, "Process", fake)
         assert utils.set_ionice(42, 3, 5) is True
-        assert cmds[0] == ["ionice", "-c", "3", "-p", "42"]
+        assert fake.calls == [(3,)]
 
     def test_no_level(self, monkeypatch):
-        cmds = self._capture(monkeypatch)
+        fake = _FakeIONice()
+        monkeypatch.setattr(utils.psutil, "Process", fake)
         assert utils.set_ionice(42, 1) is True
-        assert cmds[0] == ["ionice", "-c", "1", "-p", "42"]
+        assert fake.calls == [(1,)]
 
     def test_failure(self, monkeypatch):
-        self._capture(monkeypatch, returncode=1)
+        monkeypatch.setattr(utils.psutil, "Process", _FakeIONice(fail=True))
         assert utils.set_ionice(42, 2, 0) is False
+
+
+class TestGetIonice:
+    def test_success(self, monkeypatch):
+        monkeypatch.setattr(utils.psutil, "Process", _FakeIONice(ioclass=2, value=4))
+        assert utils.get_ionice(42) == (2, 4)
+
+    def test_gone_returns_none(self, monkeypatch):
+        monkeypatch.setattr(utils.psutil, "Process", _FakeIONice(fail=True))
+        assert utils.get_ionice(42) is None
+
+
+class TestGetAffinitySet:
+    def test_success(self, monkeypatch):
+        monkeypatch.setattr(utils.os, "sched_getaffinity", lambda pid: {0, 1})
+        assert utils.get_affinity_set(42) == {0, 1}
+
+    def test_gone_returns_none(self, monkeypatch):
+        def getaff(pid):
+            raise ProcessLookupError()
+        monkeypatch.setattr(utils.os, "sched_getaffinity", getaff)
+        assert utils.get_affinity_set(42) is None

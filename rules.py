@@ -99,21 +99,58 @@ class RuleEngine:
                 self._rules[i] = rule
                 return
 
+    def has_match(self, proc_name: str) -> bool:
+        """True if any enabled rule matches proc_name."""
+        return any(r.matches(proc_name) for r in self._rules)
+
     def to_dict_list(self) -> list[dict]:
         return [r.to_dict() for r in self._rules]
 
-    def apply_to_process(self, pid: int, proc_name: str) -> list[str]:
-        """Apply all matching rules to a process. Returns list of action strings."""
+    def _affinity_applied(self, pid: int, cpulist: str) -> bool:
+        """True if the process already runs on the requested CPU set.
+        Offline (parked) CPUs are excluded from the comparison — the kernel
+        can only honor the online part of the requested set."""
+        try:
+            desired = utils.cpulist_to_set(cpulist)
+        except ValueError:
+            return False
+        current = utils.get_affinity_set(pid)
+        if current is None:
+            return False
+        effective = desired & utils.get_online_cpus()
+        return bool(effective) and current == effective
+
+    def _ionice_applied(self, pid: int, ionice_class: int, ionice_level: int | None) -> bool:
+        current = utils.get_ionice(pid)
+        if current is None:
+            return False
+        cur_class, cur_level = current
+        if cur_class != ionice_class:
+            return False
+        if ionice_class in (1, 2) and ionice_level is not None:
+            return cur_level == ionice_level
+        return True
+
+    def apply_to_process(self, pid: int, proc_name: str, skip_nice: bool = False) -> list[str]:
+        """Apply all matching rules to a process. Returns list of action strings.
+
+        Values already in effect are left alone (drift check) so the periodic
+        enforcement loop doesn't re-apply — and re-log — unchanged settings
+        every tick.
+
+        skip_nice: leave the nice value alone (used while ProBalance has the
+        process throttled, so enforcement doesn't undo the throttle).
+        """
         actions = []
         for rule in self._rules:
             if not rule.matches(proc_name):
                 continue
-            if rule.affinity is not None:
+            if rule.affinity is not None and not self._affinity_applied(pid, rule.affinity):
                 if utils.set_affinity(pid, rule.affinity):
                     msg = f"[Rule:{rule.name}] Set affinity={rule.affinity} on {proc_name}({pid})"
                     self._log(msg)
                     actions.append(msg)
-            if rule.nice is not None:
+            if rule.nice is not None and not skip_nice and utils.get_nice(pid) != rule.nice:
                 if utils.set_nice(pid, rule.nice):
                     msg = f"[Rule:{rule.name}] Set nice={rule.nice} on {proc_name}({pid})"
                     self._log(msg)
@@ -122,7 +159,9 @@ class RuleEngine:
                     msg = f"[Rule:{rule.name}] nice={rule.nice} failed (root needed?) for {proc_name}({pid})"
                     self._log(msg)
                     actions.append(msg)
-            if rule.ionice_class is not None:
+            if rule.ionice_class is not None and not self._ionice_applied(
+                pid, rule.ionice_class, rule.ionice_level
+            ):
                 if utils.set_ionice(pid, rule.ionice_class, rule.ionice_level):
                     msg = f"[Rule:{rule.name}] Set ionice class={rule.ionice_class} level={rule.ionice_level} on {proc_name}({pid})"
                     self._log(msg)

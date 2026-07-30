@@ -149,8 +149,8 @@ class MonitorThread(QThread):
                 except OSError:
                     cmdline_raw = []
                 name = _resolve_name(comm, cmdline_raw)
-                actions = self._rule_engine.apply_to_process(pid, name)
-                if not actions:
+                self._rule_engine.apply_to_process(pid, name)
+                if not self._rule_engine.has_match(name):
                     if utils.set_affinity(pid, default):
                         self._emit_log(f"[Default] affinity={default} → {name}({pid})")
             except OSError:
@@ -224,8 +224,8 @@ class MonitorThread(QThread):
         pid = info["pid"]
         name = info["name"]
         self._capture_original(pid)
-        actions = self._rule_engine.apply_to_process(pid, name)
-        if actions:
+        self._rule_engine.apply_to_process(pid, name)
+        if self._rule_engine.has_match(name):
             # Rule matched — if gaming mode + elevate_nice, apply nice -1
             if self._gaming_mode and self._gaming_mode_elevate_nice and pid not in self._gaming_niced:
                 import cpu_park
@@ -255,6 +255,19 @@ class MonitorThread(QThread):
           try:
             now = time.monotonic()
 
+            elapsed_enforce = now - last_enforce
+            elapsed_pb = now - last_probalance
+            elapsed_snap = now - last_snapshot
+
+            # Nothing consumes the snapshot more often than the enforce
+            # interval — skip the (expensive) full process scan until one of
+            # the consumers is due, instead of scanning every 0.1s tick.
+            if (elapsed_enforce < enforce_interval
+                    and elapsed_pb < 1.0
+                    and elapsed_snap < snapshot_interval):
+                time.sleep(tick_interval)
+                continue
+
             # Collect current snapshot
             try:
                 procs = list(psutil.process_iter())
@@ -278,21 +291,22 @@ class MonitorThread(QThread):
             self._known_pids = current_pids
             snapshot = new_snapshot
 
-            elapsed_enforce = now - last_enforce
-            elapsed_pb = now - last_probalance
-            elapsed_snap = now - last_snapshot
-
             # Rule enforcement every 0.5s (rules only — not default, too expensive)
             if elapsed_enforce >= enforce_interval:
                 # Expire stale manual overrides
                 self._manual_overrides = {
                     pid: exp for pid, exp in self._manual_overrides.items() if exp > now
                 }
+                # Leave nice alone on PIDs ProBalance is throttling, or
+                # enforcement would undo the throttle every tick.
+                throttled = self._probalance.get_throttled_pids()
                 for info in snapshot:
                     pid = info["pid"]
                     if pid in self._manual_overrides:
                         continue  # user manually set affinity — don't override for now
-                    self._rule_engine.apply_to_process(pid, info["name"])
+                    self._rule_engine.apply_to_process(
+                        pid, info["name"], skip_nice=pid in throttled
+                    )
                 last_enforce = now
 
             # ProBalance every 1.0s

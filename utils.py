@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import logging
+
+import psutil
 
 log = logging.getLogger(__name__)
 
@@ -89,45 +90,59 @@ def _cpuset_to_cpulist(cpus: set[int]) -> str:
 
 
 def set_nice(pid: int, nice: int) -> bool:
-    """Set nice priority via renice.
-    Negative values require root — failure logged silently.
+    """Set nice priority via setpriority(2) — no subprocess, fast enough to
+    call from the enforcement loop.
+    Lowering nice (raising priority) requires CAP_SYS_NICE/root.
     Returns True on success."""
     try:
-        result = subprocess.run(
-            ["renice", "-n", str(nice), "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            log.debug("renice pid=%d nice=%d: OK", pid, nice)
-            return True
-        log.warning("renice pid=%d nice=%d failed: %s", pid, nice, result.stderr.strip())
+        os.setpriority(os.PRIO_PROCESS, pid, nice)
+        log.debug("setpriority pid=%d nice=%d: OK", pid, nice)
+        return True
+    except (PermissionError, ProcessLookupError, OSError) as e:
+        log.warning("setpriority pid=%d nice=%d failed: %s", pid, nice, e)
         return False
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        log.warning("renice error pid=%d: %s", pid, e)
-        return False
+
+
+def get_nice(pid: int) -> int | None:
+    """Return current nice value, or None if the process is gone/denied."""
+    try:
+        return os.getpriority(os.PRIO_PROCESS, pid)
+    except OSError:
+        return None
 
 
 def set_ionice(pid: int, ionice_class: int, ionice_level: int | None = None) -> bool:
-    """Set I/O priority via ionice.
+    """Set I/O priority via the ioprio_set syscall (through psutil).
     class: 1=realtime, 2=best-effort, 3=idle
     level: 0-7 (only for classes 1 and 2)
     Returns True on success."""
     try:
-        cmd = ["ionice", "-c", str(ionice_class)]
-        if ionice_level is not None and ionice_class in (1, 2):
-            cmd += ["-n", str(ionice_level)]
-        cmd += ["-p", str(pid)]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            log.debug("ionice pid=%d class=%d level=%s: OK", pid, ionice_class, ionice_level)
-            return True
-        log.warning("ionice pid=%d class=%d failed: %s", pid, ionice_class, result.stderr.strip())
+        if ionice_class in (1, 2) and ionice_level is not None:
+            psutil.Process(pid).ionice(ionice_class, ionice_level)
+        else:
+            psutil.Process(pid).ionice(ionice_class)
+        log.debug("ionice pid=%d class=%d level=%s: OK", pid, ionice_class, ionice_level)
+        return True
+    except (psutil.Error, OSError, ValueError) as e:
+        log.warning("ionice pid=%d class=%d failed: %s", pid, ionice_class, e)
         return False
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        log.warning("ionice error pid=%d: %s", pid, e)
-        return False
+
+
+def get_ionice(pid: int) -> tuple[int, int] | None:
+    """Return current (class, level), or None if the process is gone/denied."""
+    try:
+        pri = psutil.Process(pid).ionice()
+        return int(pri.ioclass), int(pri.value)
+    except (psutil.Error, OSError):
+        return None
+
+
+def get_affinity_set(pid: int) -> set[int] | None:
+    """Return the main thread's current CPU set, or None if gone/denied."""
+    try:
+        return set(os.sched_getaffinity(pid))
+    except OSError:
+        return None
 
 
 def get_online_cpus() -> set[int]:
