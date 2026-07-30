@@ -54,6 +54,10 @@ def _safe_proc_info(proc: psutil.Process) -> dict | None:
             cpu = proc.cpu_percent()
             mem = proc.memory_info().rss
             try:
+                create_time = proc.create_time()
+            except (psutil.AccessDenied, AttributeError):
+                create_time = 0.0
+            try:
                 nice = proc.nice()
             except (psutil.AccessDenied, AttributeError):
                 nice = 0
@@ -74,6 +78,7 @@ def _safe_proc_info(proc: psutil.Process) -> dict | None:
                 cmdline_str = ""
             return {
                 "pid": pid,
+                "create_time": create_time,
                 "name": name,
                 "cpu_percent": cpu,
                 "mem_rss": mem,
@@ -105,16 +110,18 @@ class MonitorThread(QThread):
         self._probalance = probalance
         self._config = config
         self._stop = False
-        self._known_pids: set[int] = set()
+        # Processes are identified by (pid, create_time) so a recycled PID is
+        # treated as a brand-new process (rules re-applied, no stale state).
+        self._known_procs: set[tuple[int, float]] = set()
 
         # Track original affinity before we change it, for "Reset All" function.
-        # pid → frozenset of CPU numbers that were online when we first touched the process.
-        self._original_affinities: dict[int, frozenset] = {}
+        # (pid, create_time) → frozenset of CPUs when we first touched the process.
+        self._original_affinities: dict[tuple[int, float], frozenset] = {}
 
-        # Gaming Mode nice -1 tracking: pid → original nice value before we elevated it
+        # Gaming Mode nice -1 tracking: (pid, create_time) → original nice
         self._gaming_mode: bool = False
         self._gaming_mode_elevate_nice: bool = False
-        self._gaming_niced: dict[int, int] = {}  # pid → original nice
+        self._gaming_niced: dict[tuple[int, float], int] = {}
 
         # Manual affinity overrides: pid → expiry monotonic time.
         # While an entry is active, the enforcement loop skips rule re-application
@@ -131,6 +138,18 @@ class MonitorThread(QThread):
     def _default_affinity(self) -> str | None:
         return self._config.get("cpu", {}).get("default_affinity") or None
 
+    @staticmethod
+    def _same_process(pid: int, create_time: float) -> bool:
+        """True if pid still refers to the process we recorded (guards against
+        PID reuse when restoring state). create_time 0.0 means unknown —
+        accept the pid as-is."""
+        if not create_time:
+            return True
+        try:
+            return abs(psutil.Process(pid).create_time() - create_time) < 1e-4
+        except psutil.Error:
+            return False
+
     def update_config(self, config: dict):
         self._config = config
         self._probalance.update_config(config.get("probalance", {}))
@@ -141,7 +160,7 @@ class MonitorThread(QThread):
         default = self._default_affinity()
         if not default:
             return
-        for pid in list(self._known_pids):
+        for pid, _ct in list(self._known_procs):
             try:
                 comm = open(f"/proc/{pid}/comm").read().strip()
                 try:
@@ -149,8 +168,8 @@ class MonitorThread(QThread):
                 except OSError:
                     cmdline_raw = []
                 name = _resolve_name(comm, cmdline_raw)
-                actions = self._rule_engine.apply_to_process(pid, name)
-                if not actions:
+                self._rule_engine.apply_to_process(pid, name)
+                if not self._rule_engine.has_match(name):
                     if utils.set_affinity(pid, default):
                         self._emit_log(f"[Default] affinity={default} → {name}({pid})")
             except OSError:
@@ -168,7 +187,9 @@ class MonitorThread(QThread):
         """Restore nice values to original for all game processes we elevated."""
         import cpu_park
         count = 0
-        for pid, orig_nice in list(self._gaming_niced.items()):
+        for (pid, ct), orig_nice in list(self._gaming_niced.items()):
+            if not self._same_process(pid, ct):
+                continue
             try:
                 if cpu_park.set_process_nice_via_helper(pid, orig_nice):
                     count += 1
@@ -193,7 +214,9 @@ class MonitorThread(QThread):
         online = utils.get_cpu_count()
         all_cpus = set(range(online))
         count = 0
-        for pid, orig in list(self._original_affinities.items()):
+        for (pid, ct), orig in list(self._original_affinities.items()):
+            if not self._same_process(pid, ct):
+                continue
             try:
                 # Restore to captured original; fall back to all CPUs
                 mask = orig if orig else all_cpus
@@ -210,12 +233,12 @@ class MonitorThread(QThread):
         self._original_affinities.clear()
         self._emit_log(f"[Reset] Restored affinity on {count} processes to original state.")
 
-    def _capture_original(self, pid: int):
+    def _capture_original(self, key: tuple[int, float]):
         """Store the current affinity of a process before we change it."""
-        if pid in self._original_affinities:
+        if key in self._original_affinities:
             return
         try:
-            self._original_affinities[pid] = frozenset(os.sched_getaffinity(pid))
+            self._original_affinities[key] = frozenset(os.sched_getaffinity(key[0]))
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -223,15 +246,16 @@ class MonitorThread(QThread):
         """Apply rules or default affinity to a newly seen process."""
         pid = info["pid"]
         name = info["name"]
-        self._capture_original(pid)
-        actions = self._rule_engine.apply_to_process(pid, name)
-        if actions:
+        key = (pid, info.get("create_time", 0.0))
+        self._capture_original(key)
+        self._rule_engine.apply_to_process(pid, name)
+        if self._rule_engine.has_match(name):
             # Rule matched — if gaming mode + elevate_nice, apply nice -1
-            if self._gaming_mode and self._gaming_mode_elevate_nice and pid not in self._gaming_niced:
+            if self._gaming_mode and self._gaming_mode_elevate_nice and key not in self._gaming_niced:
                 import cpu_park
                 orig_nice = info.get("nice", 0)
                 if cpu_park.set_process_nice_via_helper(pid, -1):
-                    self._gaming_niced[pid] = orig_nice
+                    self._gaming_niced[key] = orig_nice
                     self._emit_log(f"[Gaming Mode] nice -1 → {name}({pid})")
         else:
             default = self._default_affinity()
@@ -255,6 +279,19 @@ class MonitorThread(QThread):
           try:
             now = time.monotonic()
 
+            elapsed_enforce = now - last_enforce
+            elapsed_pb = now - last_probalance
+            elapsed_snap = now - last_snapshot
+
+            # Nothing consumes the snapshot more often than the enforce
+            # interval — skip the (expensive) full process scan until one of
+            # the consumers is due, instead of scanning every 0.1s tick.
+            if (elapsed_enforce < enforce_interval
+                    and elapsed_pb < 1.0
+                    and elapsed_snap < snapshot_interval):
+                time.sleep(tick_interval)
+                continue
+
             # Collect current snapshot
             try:
                 procs = list(psutil.process_iter())
@@ -262,25 +299,22 @@ class MonitorThread(QThread):
                 procs = []
 
             new_snapshot = []
-            current_pids = set()
+            current_procs = set()
             for proc in procs:
                 info = _safe_proc_info(proc)
                 if info is not None:
                     new_snapshot.append(info)
-                    current_pids.add(info["pid"])
+                    current_procs.add((info["pid"], info.get("create_time", 0.0)))
 
-            # Detect new PIDs: apply matching rule OR default affinity
-            new_pids = current_pids - self._known_pids
-            if new_pids:
+            # Detect new processes: apply matching rule OR default affinity.
+            # Keyed by (pid, create_time) so a recycled PID counts as new.
+            new_procs = current_procs - self._known_procs
+            if new_procs:
                 for info in new_snapshot:
-                    if info["pid"] in new_pids:
+                    if (info["pid"], info.get("create_time", 0.0)) in new_procs:
                         self._apply_new_pid(info)
-            self._known_pids = current_pids
+            self._known_procs = current_procs
             snapshot = new_snapshot
-
-            elapsed_enforce = now - last_enforce
-            elapsed_pb = now - last_probalance
-            elapsed_snap = now - last_snapshot
 
             # Rule enforcement every 0.5s (rules only — not default, too expensive)
             if elapsed_enforce >= enforce_interval:
@@ -288,11 +322,16 @@ class MonitorThread(QThread):
                 self._manual_overrides = {
                     pid: exp for pid, exp in self._manual_overrides.items() if exp > now
                 }
+                # Leave nice alone on PIDs ProBalance is throttling, or
+                # enforcement would undo the throttle every tick.
+                throttled = self._probalance.get_throttled_pids()
                 for info in snapshot:
                     pid = info["pid"]
                     if pid in self._manual_overrides:
                         continue  # user manually set affinity — don't override for now
-                    self._rule_engine.apply_to_process(pid, info["name"])
+                    self._rule_engine.apply_to_process(
+                        pid, info["name"], skip_nice=pid in throttled
+                    )
                 last_enforce = now
 
             # ProBalance every 1.0s
@@ -326,3 +365,9 @@ class MonitorThread(QThread):
           except Exception as exc:
             log.exception("MonitorThread: unexpected error in main loop: %s", exc)
             time.sleep(1.0)  # brief back-off to avoid busy-spinning on persistent errors
+
+        # Revert any active throttles (nice or cgroup caps) on shutdown
+        try:
+            self._probalance.shutdown()
+        except Exception:
+            log.exception("MonitorThread: ProBalance shutdown failed")
