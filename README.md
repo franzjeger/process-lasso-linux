@@ -1,5 +1,9 @@
 # Process Lasso for Linux — CPU affinity manager with Gaming Mode
 
+## Project Status
+**Active Development** — This project is currently being maintained and updated.
+
+
 A KDE/Linux process manager inspired by Windows Process Lasso. Built with Python + PyQt6.
 
 ## Screenshots
