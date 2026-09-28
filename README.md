@@ -1,8 +1,29 @@
-# Process Lasso for Linux — CPU affinity manager with Gaming Mode
+# Process Lasso for Linux — archived
 
-## Project Status
-**Active Development** — This project is currently being maintained and updated.
+> **Development has moved to [Argus-Lasso](https://github.com/franzjeger/argus-lasso).**
+>
+> This Python/PyQt6 repository is no longer maintained and is retained as a historical archive. There will be no further fixes, releases or pull-request reviews here.
 
+## Use Argus-Lasso instead
+
+[**Argus-Lasso**](https://github.com/franzjeger/argus-lasso) is the official successor and the version I recommend. It is the more capable version of this project, built in Rust with egui, and it is where I will continue all development.
+
+Argus-Lasso carries forward process management, CPU affinity rules, ProBalance and Gaming Mode, with hardware monitoring, a Vulkan overlay and game performance recording in the current source tree. See its README for the distinction between published releases and features available from source.
+
+- [Argus-Lasso repository and current status](https://github.com/franzjeger/argus-lasso)
+- [Installation instructions](https://github.com/franzjeger/argus-lasso/blob/master/docs/installation.md)
+- [User guide](https://github.com/franzjeger/argus-lasso/blob/master/docs/user-guide.md)
+- [Report issues or request features in Argus-Lasso](https://github.com/franzjeger/argus-lasso/issues)
+
+If you maintain a fork of this repository, you are welcome to continue it independently. For future upstream work and contributions, please use Argus-Lasso. This is a separate Rust implementation; do not assume that Python patches or configuration files can be applied unchanged.
+
+Thank you to everyone who tried, reported issues with or forked Process Lasso for Linux.
+
+---
+
+## Historical documentation
+
+The material below describes the discontinued Python version. For new installations, use the Argus-Lasso instructions linked above.
 
 A KDE/Linux process manager inspired by Windows Process Lasso. Built with Python + PyQt6.
 
