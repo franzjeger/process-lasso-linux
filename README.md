@@ -4,6 +4,8 @@
 >
 > This Python/PyQt6 repository is no longer maintained and is retained as a historical archive. There will be no further fixes, releases or pull-request reviews here.
 
+[Read the retirement announcement and notice to fork maintainers](https://github.com/franzjeger/process-lasso-linux/issues/6).
+
 ## Use Argus-Lasso instead
 
 [**Argus-Lasso**](https://github.com/franzjeger/argus-lasso) is the official successor and the version I recommend. It is the more capable version of this project, built in Rust with egui, and it is where I will continue all development.
